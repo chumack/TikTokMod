@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+
+# electron-builder output (installers, unpacked app, blockmaps)
+/dist/
+
+# Vendored third-party binaries: large, platform-specific, and re-downloaded by
+# scripts/postinstall.js on `npm install`. Never committed.
+vendor/bin/
+
+# Everything else under vendor/ is ignored EXCEPT the vendored X-Gnarly
+# implementation below. Ignore the directory contents first, then re-include.
+/vendor/*
+!/vendor/x-gnarly/
+
+# Runtime scratch
+*.part
+*.tmp
+
+# Local scratch files. probe.json is a yt-dlp `-J` probe dump and err.log is a
+# Chromium console log: both are captured from a live, logged-in TikTok session
+# and contain real ttwid / tt_csrf_token cookie values and signed CDN URLs.
+/probe.json
+/out.log
+/err.log
+*.log
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,15 @@
+# Normalise line endings in the repository; check them out as LF on every
+# platform. The project is developed on Windows and packaged for Windows and
+# Linux, so without this a Windows checkout rewrites every tracked file to CRLF
+# and the diff churns across contributors.
+* text=auto eol=lf
+
+# Keep build artifacts and vendored binaries byte-exact if they are ever staged.
+*.exe binary
+*.dll binary
+*.AppImage binary
+*.deb binary
+*.blockmap binary
+*.png binary
+*.ico binary
+*.icns binary

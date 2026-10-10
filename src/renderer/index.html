@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'" />
+  <title>TikTokMod</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">TT</span>
+      <span class="name">TikTokMod</span>
+    </div>
+
+    <nav class="tabs" id="tabs">
+      <button class="tab" data-view="download">Скачать</button>
+      <button class="tab" data-view="author">Автор</button>
+      <button class="tab active" data-view="browser">Обзор</button>
+      <button class="tab" data-view="geo">Гео-обход</button>
+      <button class="tab" data-view="settings">Настройки</button>
+    </nav>
+
+    <div class="status" id="status">
+      <span class="dot" id="netDot"></span>
+      <span id="netLabel">проверка…</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- ============ СКАЧАТЬ ============ -->
+    <section class="view" id="view-download">
+      <div class="panel">
+        <div class="row">
+          <input id="urlInput" type="url" placeholder="https://www.tiktok.com/@user/video/1234567890" spellcheck="false" />
+          <button id="fetchBtn" class="btn primary">Получить</button>
+          <button id="pasteBtn" class="btn">Вставить</button>
+        </div>
+        <div id="fetchStatus" class="hint"></div>
+        <div id="fetchHint" class="hidden">
+          <div class="note warn"><b>Это не ссылка на видео</b> <span id="fetchHintText"></span></div>
+          <div class="row">
+            <button id="fetchHintGo" class="btn primary">Перейти во вкладку «Обзор»</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="preview" class="panel hidden"></div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Очередь загрузок</h2>
+          <div class="row">
+            <button id="cancelAllBtn" class="btn small">Отменить всё</button>
+            <!-- «Очистить» удаляет ТОЛЬКО строки из списка очереди. Файлы на диске и папку
+                 загрузок он не трогает: уже скачанные видео остаются на месте. -->
+            <button id="queueClearBtn" class="btn small">Очистить</button>
+          </div>
+        </div>
+        <div id="queue" class="queue"></div>
+        <div class="empty" id="queueEmpty">Очередь пуста</div>
+      </div>
+    </section>
+
+    <!-- ============ АВТОР ============ -->
+    <section class="view" id="view-author">
+      <div class="panel">
+        <div class="row">
+          <input id="authorInput" type="text" placeholder="https://www.tiktok.com/@username — ссылка на профиль" spellcheck="false" />
+          <button id="authorFetchBtn" class="btn primary">Загрузить видео</button>
+        </div>
+        <div class="row small-row">
+          <button id="authorPasteBtn" class="btn small">Вставить</button>
+          <span class="hint">Список берётся из мобильного API TikTok с подменой региона — это надёжнее парсинга страницы профиля.</span>
+        </div>
+        <div id="authorStatus" class="hint"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Видео автора <span id="authorName" class="muted"></span></h2>
+          <div class="row">
+            <button id="authorLoadMore" class="btn small" disabled>Загрузить ещё</button>
+            <button id="authorDownloadAll" class="btn small">Скачать все</button>
+            <button id="authorCancelAll" class="btn small">Отменить</button>
+          </div>
+        </div>
+        <div id="authorGrid" class="grid"></div>
+        <div class="empty" id="authorEmpty">Список пуст</div>
+      </div>
+    </section>
+
+    <!-- ============ ОБЗОР ============ -->
+    <section class="view active" id="view-browser">
+      <div class="browser-panel">
+        <input id="browserUrl" type="hidden" value="https://www.tiktok.com/foryou" spellcheck="false" />
+        <button id="browserGo" hidden>Перейти</button>
+        <button id="browserDownloadPage" hidden>Скачать видео со страницы</button>
+        <div id="browserHost" class="webview-host"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Скачивание из ленты</h2>
+          <div class="row">
+            <button id="feedNowBtn" class="btn primary">Скачать текущее видео</button>
+          </div>
+        </div>
+        <div class="row small-row">
+          <span class="hint" id="feedStatus">Кнопка «Скачать текущее видео» сохраняет ролик, который сейчас показывает лента рекомендаций, без водяного знака.</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ ГЕО-ОБХОД ============ -->
+    <section class="view" id="view-geo">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Состояние обхода</h2>
+          <button id="geoRefreshBtn" class="btn small">Обновить</button>
+        </div>
+        <div id="geoVerdict" class="verdict">проверка…</div>
+        <div id="geoFacts" class="facts"></div>
+        <div id="geoNotes" class="notes"></div>
+        <div class="row">
+          <input id="geoCheckUrl" type="url" placeholder="Ссылка на видео для проверки (необязательно)" spellcheck="false" />
+          <button id="geoCheckBtn" class="btn primary">Проверить</button>
+        </div>
+        <div id="geoCheckOut" class="hint"></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>Эмулируемое устройство</h2></div>
+        <div class="form">
+          <label class="field">
+            <span>Регион</span>
+            <select id="geoRegion"></select>
+            <small>
+              Регион, часовой пояс и оператор отправляются в мобильный API TikTok.
+              Это сетевой эквивалент подмены SIM-карты, которую делает модуль
+              UnleashedTikTok на Android.
+            </small>
+          </label>
+
+          <label class="field">
+            <span>Оператор</span>
+            <select id="geoCarrier"></select>
+            <small>MCC+MNC оператора: приложение заявляет, что подключено к сети выбранной страны.</small>
+          </label>
+
+          <div class="grid-2">
+            <label class="field">
+              <span>Прокси</span>
+              <input id="geoProxy" type="text" placeholder="socks5://127.0.0.1:1080" spellcheck="false" />
+            </label>
+            <label class="field">
+              <span>Часовой пояс</span>
+              <input id="geoTimezone" type="text" placeholder="Europe/Minsk" spellcheck="false" />
+            </label>
+          </div>
+
+          <div class="row">
+            <button id="geoApplyBtn" class="btn primary">Применить и перепроверить</button>
+            <span id="geoApplyOut" class="hint"></span>
+          </div>
+
+          <div class="checks">
+            <label class="check"><input type="checkbox" id="geoShowAdvanced" /> Показать параметры запроса</label>
+          </div>
+          <pre id="geoParams" class="params hidden"></pre>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>Как это работает</h2></div>
+        <div class="prose">
+          <p>
+            Мобильные приложения TikTok определяют страну по SIM-карте. Модуль
+            <code>UnleashedTikTok</code> подменяет ответы <code>TelephonyManager</code>
+            (страна <code>BY</code>, оператор <code>25704</code>), и официальный APK
+            ведёт себя как белорусский телефон.
+          </p>
+          <p>
+            На десктопе этих вызовов нет, поэтому то же самое делается на уровне сети:
+            приложение само указывает регион, оператора, часовой пояс и идентификатор
+            устройства в мобильном API TikTok. Запрос уходит <code>POST</code> на
+            <code>/aweme/v1/multi/aweme/detail/</code> — тот же эндпоинт, который
+            использует yt-dlp, и он принимает пустой <code>X-Argus</code>, то есть
+            подпись запросов не нужна.
+          </p>
+          <p class="warn-text">
+            Подмена региона меняет только то, что приложение сообщает о себе. Самый
+            частый источник «TikTok показывает только старые видео» — реальный IP:
+            сервер применяет ограничения по адресу подключения. Прокси в выбранной
+            стране остаётся обязательной частью схемы.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============ НАСТРОЙКИ ============ -->
+    <section class="view" id="view-settings">
+      <div class="panel">
+        <div class="panel-head"><h2>Сеть и обход региональных ограничений</h2></div>
+        <div class="form">
+          <label class="field">
+            <span>Прокси</span>
+            <input id="setProxy" type="text" placeholder="socks5://127.0.0.1:1080 или http://user:pass@host:port" spellcheck="false" />
+            <small>Пусто = системные настройки. Поддерживаются http, https, socks5, socks5h.</small>
+          </label>
+
+          <label class="field">
+            <span>Cookies из браузера</span>
+            <select id="setCookiesBrowser">
+              <option value="none">Не использовать</option>
+              <option value="chrome">Chrome</option>
+              <option value="chromium">Chromium</option>
+              <option value="edge">Edge</option>
+              <option value="firefox">Firefox</option>
+              <option value="brave">Brave</option>
+              <option value="opera">Opera</option>
+              <option value="vivaldi">Vivaldi</option>
+              <option value="safari">Safari</option>
+            </select>
+            <small>Нужны, если TikTok требует вход или подтверждение возраста.</small>
+          </label>
+
+          <label class="field">
+            <span>Файл cookies (Netscape)</span>
+            <input id="setCookieFile" type="text" placeholder="C:\path\cookies.txt" spellcheck="false" />
+            <small>Используется, если браузер не выбран.</small>
+          </label>
+
+          <div class="grid-2">
+            <label class="field">
+              <span>Регион (2 буквы)</span>
+              <input id="setRegion" type="text" placeholder="US" maxlength="2" spellcheck="false" />
+            </label>
+            <label class="field">
+              <span>Язык navigator</span>
+              <input id="setLang" type="text" placeholder="en-US" spellcheck="false" />
+            </label>
+          </div>
+
+          <label class="field">
+            <span>Часовой пояс</span>
+            <input id="setTimezone" type="text" placeholder="Europe/Moscow" spellcheck="false" />
+            <small>Должен совпадать с регионом прокси.</small>
+          </label>
+
+          <label class="field">
+            <span>API host</span>
+            <input id="setApiHost" type="text" placeholder="api16-normal-c-useast1a.tiktokv.com" spellcheck="false" />
+            <small>Мобильный хост отвечает без подписи запросов. Пусто = мобильный API по умолчанию; значение www.tiktok.com включает веб-путь, который чаще упирается в геоблок.</small>
+          </label>
+
+          <label class="field">
+            <span>Движок метаданных</span>
+            <select id="setEngine">
+              <option value="auto">Авто: мобильный API, при отказе yt-dlp</option>
+              <option value="api">Только мобильный API (с подменой региона)</option>
+              <option value="ytdlp">Только yt-dlp</option>
+            </select>
+            <small>Файлы всегда скачивает yt-dlp: он умеет склейку, докачку и прогресс.</small>
+          </label>
+
+          <div class="grid-2">
+            <label class="field">
+              <span>ttwid (необязательно)</span>
+              <input id="setTtwid" type="text" placeholder="из cookies браузера" spellcheck="false" />
+            </label>
+            <label class="field">
+              <span>msToken (необязательно)</span>
+              <input id="setMsToken" type="text" placeholder="из cookies браузера" spellcheck="false" />
+            </label>
+          </div>
+
+          <div class="grid-2">
+            <label class="field">
+              <span>Подпись запросов</span>
+              <select id="setSignerEnabled">
+                <option value="off">Выключена</option>
+                <option value="gnarly">X-Gnarly (веб, встроенная)</option>
+                <option value="mobile">Мобильные подписи (Python sidecar)</option>
+              </select>
+              <small>С мая 2025 мобильный API отвечает пустым телом без подписей (yt-dlp#13134). Выключено = как раньше.</small>
+            </label>
+            <label class="field">
+              <span>Скрипт подписанта</span>
+              <input id="setSignerPath" type="text" placeholder="путь к .py или команда" spellcheck="false" />
+              <small>Только для «Мобильные подписи»: получает JSON {url,method,body,cookie,ts} и печатает {headers:{...}}.</small>
+            </label>
+          </div>
+          <div class="row">
+            <button id="signerTestBtn" class="btn">Проверить подпись</button>
+            <span id="signerTestOut" class="hint"></span>
+          </div>
+
+          <label class="field">
+            <span>App info</span>
+            <input id="setAppInfo" type="text" placeholder="musical_ly/35.1.3/2023501030" spellcheck="false" />
+          </label>
+
+          <label class="field">
+            <span>Device ID</span>
+            <input id="setDeviceId" type="text" placeholder="случайные цифры" spellcheck="false" />
+          </label>
+
+          <div class="row">
+            <button id="netTestBtn" class="btn primary">Проверить доступ к TikTok</button>
+            <span id="netTestOut" class="hint"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>Загрузки</h2></div>
+        <div class="form">
+          <label class="field">
+            <span>Папка</span>
+            <div class="row">
+              <input id="setDir" type="text" spellcheck="false" />
+              <button id="pickDirBtn" class="btn">Обзор…</button>
+              <button id="openDirBtn" class="btn">Открыть</button>
+            </div>
+          </label>
+
+          <label class="field">
+            <span>Качество</span>
+            <select id="setFormat">
+              <option value="best">Лучшее (H.264, без watermark)</option>
+              <option value="best-no-watermark">Только без watermark</option>
+              <option value="worst">Худшее (минимальный размер)</option>
+              <option value="custom">Своя строка формата</option>
+            </select>
+          </label>
+
+          <label class="check">
+            <input id="setPreferH265" type="checkbox" />
+            <span>Предпочитать HEVC (H.265) — файлы меньше, но играют не во всех плеерах</span>
+          </label>
+
+          <label class="field" id="customFormatField">
+            <span>Своя строка формата</span>
+            <input id="setCustomFormat" type="text" placeholder="bestvideo[height<=1080]+bestaudio" spellcheck="false" />
+          </label>
+
+          <div class="grid-2">
+            <label class="field">
+              <span>Максимальная высота (0 = без ограничения)</span>
+              <input id="setMaxHeight" type="number" min="0" step="1" />
+            </label>
+            <label class="field">
+              <span>Параллельных запросов</span>
+              <input id="setConcurrency" type="number" min="1" max="8" step="1" />
+            </label>
+          </div>
+
+          <div class="checks">
+            <label class="check"><input type="checkbox" id="setThumb" /> Сохранять обложку</label>
+            <label class="check"><input type="checkbox" id="setInfoJson" /> Сохранять info.json</label>
+            <label class="check"><input type="checkbox" id="setAudio" /> Только аудио</label>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>Движок</h2></div>
+        <div class="form">
+          <label class="field">
+            <span>Папка с yt-dlp / ffmpeg</span>
+            <input id="setBinDir" type="text" placeholder="пусто = автопоиск" spellcheck="false" />
+            <small>Автопоиск: vendor/bin, затем PATH.</small>
+          </label>
+          <div id="engineStatus" class="hint"></div>
+          <div class="row">
+            <button id="saveBtn" class="btn primary">Сохранить настройки</button>
+            <span id="saveOut" class="hint"></span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+  <script src="renderer.js"></script>
+</body>
+</html>
