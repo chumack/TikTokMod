@@ -9,6 +9,7 @@ const state = {
   webview: null,
   current: null, // last probed info
   authorItems: [],
+  zoom: 1, // interface scale, 0.6..1.6 — see setZoom()
 };
 
 // ---------- utils ----------
@@ -75,6 +76,94 @@ $('#tabs').addEventListener('click', (e) => {
   $$('.tab').forEach((t) => t.classList.toggle('active', t === btn));
   $$('.view').forEach((v) => v.classList.toggle('active', v.id === `view-${btn.dataset.view}`));
   if (btn.dataset.view === 'browser' && !state.webview) mountWebview();
+});
+
+// ---------- ui scale ----------
+// The settings and geo panels are taller than the window on a 1280x840 screen.
+// Scrolling already makes them reachable; this makes them FIT by scaling the app
+// chrome. The scale is applied in the main process to the app window only, so
+// the TikTok <webview> guest keeps its own 100% zoom.
+
+const ZOOM_STEP = 0.1;
+const ZOOM_KEY = 'tkm.uiZoom';
+const ZOOM_MIN = 0.6;
+const ZOOM_MAX = 1.6;
+
+const clampZoom = (v) => Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(v * 100) / 100));
+
+// Media queries see ZOOMED css pixels, so at 130% a 1280px window reports ~984px
+// and a "wide" layout keyed off a media query would switch itself OFF exactly
+// when the user asked to fit more on screen. Decide from the physical width.
+const WIDE_MIN_PX = 1040;
+function syncWideLayout() {
+  const physical = Math.round(window.innerWidth * state.zoom);
+  $('#view-settings').classList.toggle('is-wide', physical >= WIDE_MIN_PX);
+}
+
+let zoomSaveTimer = null;
+function persistZoom(f) {
+  // Trailing-edge debounce: a Ctrl+wheel burst fires ~10 of these per gesture,
+  // so push the deadline out and write the LAST value. An early `return` here
+  // would be a leading-edge throttle and would persist the first value of the
+  // burst — zoom to 160%, restart, land at 110%.
+  if (zoomSaveTimer) clearTimeout(zoomSaveTimer);
+  zoomSaveTimer = setTimeout(() => {
+    zoomSaveTimer = null;
+    try {
+      localStorage.setItem(ZOOM_KEY, String(f));
+    } catch (_) {}
+  }, 250);
+}
+
+// state.zoom is advanced SYNCHRONOUSLY, before the IPC round-trip. A trackpad
+// Ctrl+wheel burst emits one event per frame (~16ms) — several of them land
+// inside a single round-trip, and computing from an await-ed state.zoom would
+// collapse them all into one step.
+function setZoom(target) {
+  const f = clampZoom(Number(target) || 1);
+  state.zoom = f;
+  $('#zoomResetBtn').textContent = `${Math.round(f * 100)}%`;
+  syncWideLayout();
+  persistZoom(f);
+  // Never let a failed zoom call reject into boot(): an exception here would
+  // abort the rest of boot() and leave the app with no listeners at all.
+  Promise.resolve()
+    .then(() => window.api.ui.zoom(f))
+    .catch(() => {});
+}
+
+const nudgeZoom = (delta) => setZoom(state.zoom + delta);
+
+$('#zoomInBtn').addEventListener('click', () => nudgeZoom(ZOOM_STEP));
+$('#zoomOutBtn').addEventListener('click', () => nudgeZoom(-ZOOM_STEP));
+$('#zoomResetBtn').addEventListener('click', () => setZoom(1));
+
+// Capture phase: any element calling stopPropagation() on wheel would otherwise
+// silently disable Ctrl+wheel.
+window.addEventListener(
+  'wheel',
+  (e) => {
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    nudgeZoom(e.deltaY < 0 ? ZOOM_STEP : -ZOOM_STEP);
+  },
+  { passive: false, capture: true }
+);
+
+window.addEventListener('resize', syncWideLayout);
+
+window.addEventListener('keydown', (e) => {
+  if (!e.ctrlKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) {
+    return;
+  }
+  const k = e.key;
+  if (k === '=' || k === '+') nudgeZoom(ZOOM_STEP);
+  else if (k === '-' || k === '_') nudgeZoom(-ZOOM_STEP);
+  else if (k === '0') setZoom(1);
+  else return;
+  e.preventDefault();
 });
 
 // ---------- engine status ----------
@@ -984,6 +1073,13 @@ $('#netTestBtn').addEventListener('click', async () => {
   // "Обзор" is the landing tab: mount the webview before anything that can
   // block on the network, so the feed starts loading right away.
   switchTab('browser');
+
+// Restore the saved interface scale before anything measures the layout.
+  let savedZoom = 1;
+  try {
+    savedZoom = Number(localStorage.getItem(ZOOM_KEY)) || 1;
+  } catch (_) {}
+  setZoom(savedZoom);
 
   state.settings = await window.api.settings.get();
   fillSettings(state.settings);

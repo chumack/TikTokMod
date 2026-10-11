@@ -59,6 +59,9 @@ contextBridge.exposeInMainWorld('api', {
   nav: {
     open: (url) => invoke('nav:url', url),
   },
+  ui: {
+    zoom: (factor) => invoke('ui:zoom', factor),
+  },
   clipboard: {
     write: (text) => invoke('clipboard:write', text),
   },

@@ -21,6 +21,12 @@
       <button class="tab" data-view="settings">Настройки</button>
     </nav>
 
+    <div class="zoom" title="Масштаб интерфейса. Ctrl+колесо мыши и Ctrl+−/+ работают вне окна видео.">
+      <button id="zoomOutBtn" class="btn small" title="Уменьшить масштаб (Ctrl+−)" aria-label="Уменьшить масштаб">−</button>
+      <button id="zoomResetBtn" class="btn small zoom-val" title="Сбросить масштаб (Ctrl+0)" aria-label="Сбросить масштаб">100%</button>
+      <button id="zoomInBtn" class="btn small" title="Увеличить масштаб (Ctrl++)" aria-label="Увеличить масштаб">+</button>
+    </div>
+
     <div class="status" id="status">
       <span class="dot" id="netDot"></span>
       <span id="netLabel">проверка…</span>

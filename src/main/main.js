@@ -41,9 +41,6 @@ function createWindow() {
     },
   });
 
-  // Zoom with ctrl/cmd + wheel, common for browser-like apps
-  win.webContents.on('wheel', (e) => {});
-
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   win.webContents.setMaxListeners(20);
 
@@ -969,9 +966,11 @@ function buildMenu() {
         { role: 'reload' },
         { role: 'toggleDevTools' },
         { type: 'separator' },
-        { role: 'resetZoom' },
-        { role: 'zoomIn' },
-        { role: 'zoomOut' },
+        // NO resetZoom/zoomIn/zoomOut roles here on purpose. Those are Chromium
+        // window roles: they zoom whichever page has focus, and the landing tab
+        // holds a live TikTok <webview>. That would zoom the guest and leave
+        // localStorage/the % label lying. Scaling is handled in one place only —
+        // the ipcMain.handle('ui:zoom') endpoint behind the topbar buttons.
         { type: 'separator' },
         { role: 'togglefullscreen' },
       ],
@@ -1318,4 +1317,23 @@ ipcMain.handle('nav:url', (e, url) => {
 ipcMain.handle('clipboard:write', (_e, text) => {
   require('electron').clipboard.writeText(String(text || ''));
   return true;
+});
+
+// Interface scale. Deliberately applied to the app window only: the <webview>
+// guest is a separate WebContents with its own zoom controller, and Chromium's
+// HostZoomMap is keyed per origin (file:// here, https://www.tiktok.com there),
+// so shrinking the UI to fit more settings on screen never makes the TikTok page
+// blurry or unreadable.
+//
+// ZOOM_MIN/ZOOM_MAX are duplicated in src/renderer/renderer.js. The clamp here is
+// the authoritative one: a value outside the range coming from the renderer is
+// clamped here, not trusted.
+const ZOOM_MIN = 0.6;
+const ZOOM_MAX = 1.6;
+ipcMain.handle('ui:zoom', (_e, factor) => {
+  const f = Number(factor);
+  if (!Number.isFinite(f) || !win || win.isDestroyed()) return null;
+  const clamped = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, Math.round(f * 100) / 100));
+  win.webContents.setZoomFactor(clamped);
+  return clamped;
 });
