@@ -105,16 +105,12 @@
         <div id="browserHost" class="webview-host"></div>
       </div>
 
-      <div class="panel">
-        <div class="panel-head">
-          <h2>Скачивание из ленты</h2>
-          <div class="row">
-            <button id="feedNowBtn" class="btn primary">Скачать текущее видео</button>
-          </div>
-        </div>
-        <div class="row small-row">
-          <span class="hint" id="feedStatus">Кнопка «Скачать текущее видео» сохраняет ролик, который сейчас показывает лента рекомендаций, без водяного знака.</span>
-        </div>
+      <!-- Намеренно компактная панель: только кнопка. Заголовок «Скачивание из
+           ленты» и подсказка #feedStatus удалены — они растягивали панель во всю
+           ширину окна и съедали ~35px высоты видео. Теперь панель обтекает кнопку
+           (см. .feed-panel в styles.css), её ширина задаётся содержимым. -->
+      <div class="panel feed-panel">
+        <button id="feedNowBtn" class="btn primary">Скачать текущее видео</button>
       </div>
     </section>
 

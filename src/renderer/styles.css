@@ -98,6 +98,39 @@ main { flex: 1 1 auto; overflow: hidden; position: relative; }
 #view-browser .browser-panel { flex: 1 1 auto; min-height: 0; height: auto; }
 /* The feed-download panel must never push the video out of the window. */
 #view-browser > .panel { flex: 0 0 auto; }
+/* …and that same rule is deliberately NOT relaxed here: the panel has to keep
+   `flex: 0 0 auto`, otherwise a flex shrink would crush the button instead of
+   handing the freed space to the webview. */
+#view-browser > .panel.feed-panel {
+  /* `#view-browser.active` is `display:flex; flex-direction:column`, and a
+     column flex item is stretch-aligned BY DEFAULT. That default is what made
+     this panel span the full window width; `flex-end` opts this one panel out
+     of it so its width shrinks to fit its content (button + padding + border)
+     AND parks that block against the RIGHT edge, below the video.
+     DO NOT swap this back for `align-items: stretch`, `width: 100%` or a
+     `margin: 0 auto` layout — any of those re-stretches the panel across the
+     window and undoes the whole point of `.feed-panel`. Swap it for
+     `flex-start` only if the button should sit under the LEFT edge instead. */
+  align-self: flex-end;
+  max-width: 100%;
+  /* One line: no heading, no hint — just the button, vertically centred. */
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  /* Trimmed from `.panel`'s 14px/14px: there is nothing here but a button, so
+     the stock padding only ate video height. */
+  padding: 8px 10px;
+  margin-bottom: 8px;
+}
+/* `.btn` sets `white-space: nowrap`, so the button's min-content width equals its
+   full unwrapped label. On a very narrow window that min-content width wins over
+   `max-width: 100%`, the button spills out of the panel, and
+   `#view-browser.active { overflow: hidden }` silently clips it. Letting the
+   label wrap (with `min-width: 0` so the flex item may actually shrink) turns a
+   clipped button into one extra line instead. Rare path — at 940px x 160% zoom
+   the layout viewport is ~587px and the button needs ~200px — but a clipped
+   primary button is the worst possible failure here. */
+#view-browser > .panel.feed-panel > .btn { white-space: normal; min-width: 0; }
 
 /* Wide windows: the settings panels are far taller than the viewport, so put
    them side by side instead of one long column. `align-items: start` keeps each
