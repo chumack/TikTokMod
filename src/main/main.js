@@ -13,14 +13,33 @@ const regions = require('./regions');
 const ttapi = require('./ttapi');
 const signer = require('./signer');
 const feed = require('./feed');
+const live = require('./live');
+const livechat = require('./livechat');
 
 let win = null;
+// The webview guest's webContents id, remembered by ipcMain.handle('feed:register')
+// and read by the screen-recording path. It must be DECLARED: main.js is
+// 'use strict', so assigning to an undeclared name throws a ReferenceError — which
+// in `feed:register` happens on the line BEFORE feed.setWebviewId(id), leaving the
+// guest permanently unregistered and every feed read answering "the embedded
+// browser is not open" while the webview is plainly on screen.
+let feedGuestId = null;
 const ALLOWED_HOSTS = /(^|\.)(tiktok\.com|musical\.ly|tiktokcdn\.com|tiktokcdn-us\.com|tiktokv\.com|amemv\.com|byteoversea\.com|tiktokmusic\.com)$/i;
 
 // Counts every download the session handler cancelled. Exported so the
 // selftest can tell "the event never fired" from "it fired but nothing was
 // written", which look identical from the filesystem side.
 let downloadInterceptions = 0;
+
+// Makes every recording id unique even when two captures start in the same
+// millisecond. See the live:start handler for why a bare Date.now() is not
+// enough.
+let liveJobSeq = 0;
+
+// Quitting while a capture is in flight: ffmpeg is asked to finalise the
+// container, but app.quit() does not wait for it. Set while that drain runs so
+// before-quit can defer the real exit exactly once.
+let quittingAfterDrain = false;
 
 function createWindow() {
   win = new BrowserWindow({
@@ -937,10 +956,47 @@ async function runSelfTest() {
 
 app.on('window-all-closed', () => {
   ytdlp.cancelAll();
+  stopAllDomPolls();
+  live.stopAll('Приложение закрыто.');
+  // Chat sinks only live as long as their recording; closing them here flushes
+  // the last subtitle cue so the .srt is not missing its tail on a forced exit.
+  livechat.closeAll();
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', () => ytdlp.cancelAll());
+app.on('before-quit', (e) => {
+  ytdlp.cancelAll();
+  stopAllDomPolls();
+
+  const n = live.status().running;
+  if (!n) return;
+
+  // Graceful: ffmpeg is asked to finalise the container so the partial recording
+  // stays playable — SIGKILL would leave an unplayable file. That is NOT
+  // instantaneous though, and app.quit() tears the process down immediately, so
+  // the first before-quit defers the exit until the captures have closed.
+  if (quittingAfterDrain) {
+    live.stopAll('Приложение закрыто.');
+    livechat.closeAll();
+    app.exit(0);
+    return;
+  }
+  e.preventDefault();
+  quittingAfterDrain = true;
+  live.stopAll('Приложение закрыто.');
+
+  const giveUp = setTimeout(() => app.exit(0), 8000);
+  if (giveUp.unref) giveUp.unref();
+  const check = setInterval(() => {
+    if (live.status().running === 0) {
+      clearInterval(check);
+      clearTimeout(giveUp);
+      livechat.closeAll();
+      app.quit();
+    }
+  }, 200);
+  if (check.unref) check.unref();
+});
 
 // ---------- menu ----------
 
@@ -1099,6 +1155,7 @@ ipcMain.handle('yt:classify', (_e, url) => {
 // The renderer mounts <webview id="feedWebview"> lazily and reports its
 // webContents id; feed.js then runs scripts inside the loaded TikTok page.
 ipcMain.handle('feed:register', async (_e, id) => {
+  feedGuestId = Number(id) || null;
   feed.setWebviewId(id);
   attachGuestMenu(id);
   return await feed.installHooks();
@@ -1205,6 +1262,354 @@ ipcMain.handle('feed:guestPreloadUrl', () => {
 // otherwise invisible: «Загрузить видео» still "works" through the will-download
 // cancellation in createWindow(), so it can never be used as proof.
 ipcMain.on('feed:guestMenu', () => {});
+
+// ---------- LIVE recording ----------
+
+// Resolve a broadcast (link, @handle or bare handle) into a room descriptor.
+// Returns { ok:false, error, offline?, restricted? } instead of throwing so the
+// renderer can tell "nobody is live" apart from "your region is blocked".
+ipcMain.handle('live:resolve', async (_e, input) => {
+  try {
+    return await live.resolve(input, settings.get());
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+});
+
+// Live links reachable from the page open in the embedded browser.
+ipcMain.handle('live:detect', async () => {
+  try {
+    return await feed.detectLive();
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+});
+
+// Start a recording.
+//
+// The room the renderer holds was resolved when the user pressed «Запись
+// трансляции», which may have been minutes ago, and the CDN URLs inside it are
+// SIGNED — they go stale. So the handle is re-resolved here, immediately before
+// ffmpeg is spawned, and the fresh descriptor is what gets recorded. Without
+// this the capture either fails outright or, worse, silently records an empty
+// file from an expired URL.
+//
+// The re-resolve is also the trust boundary: everything ffmpeg is about to
+// fetch comes from main's own response, never from the renderer's copy.
+ipcMain.handle('live:start', async (_e, room, opts = {}) => {
+  if (!room || typeof room.handle !== 'string' || !room.handle) {
+    return { ok: false, error: 'Эфир не определён. Нажмите «Запись трансляции» ещё раз.' };
+  }
+  const s = settings.get();
+  const withChat = opts && opts.withChat === true;
+  // 'stream' (default) records the clean CDN stream; 'screen' records the page
+  // pixels via guest capturePage(), with the CDN stream as audio-only.
+  const mode = opts && opts.mode === 'screen' ? 'screen' : 'stream';
+
+  // A runaway set of parallel captures would spawn an unbounded number of
+  // ffmpeg processes; three is well past what any user records at once.
+  if (live.status().running >= 3) {
+    return { ok: false, error: 'Уже идёт 3 записи. Остановите одну из них перед началом новой.' };
+  }
+  // Screen captures are CPU-heavy (capturePage JPEGs + x264 on every tick):
+  // at most one at a time, independent of the stream cap.
+  if (mode === 'screen' && live.list().some((j) => j && j.mode === 'screen')) {
+    return { ok: false, error: 'Экранная запись уже идёт. Остановите её перед началом новой.' };
+  }
+
+  let fresh;
+  try {
+    fresh = await live.resolve(room.pageUrl || `@${room.handle}`, s);
+  } catch (e) {
+    return { ok: false, error: e.message || String(e) };
+  }
+  let resolved = fresh && fresh.ok ? fresh.room : null;
+  if (!resolved) {
+    const resolveError = (fresh && fresh.error) || 'Не удалось обновить данные эфира.';
+    if (mode !== 'screen') {
+      return { ok: false, error: resolveError };
+    }
+    // Screen mode records page PIXELS, so a missing CDN stream is not fatal —
+    // but the room identity still is (roomId routes the chat, pageUrl names the
+    // room). Offline/restricted rooms stay hard failures: recording a dead page
+    // is pointless. Anything else (e.g. "no streams") degrades to silent pixels.
+    if ((fresh && (fresh.offline || fresh.restricted)) || !room.handle) {
+      return { ok: false, error: resolveError };
+    }
+    resolved = {
+      roomId: String(room.roomId || ''),
+      handle: room.handle,
+      title: room.title || '',
+      cover: '',
+      viewers: 0,
+      startedAt: 0,
+      pageUrl: room.pageUrl || ('https://www.tiktok.com/@' + room.handle + '/live'),
+      streams: [],
+    };
+  }
+
+  // A counter, not a bare timestamp: two starts inside the same millisecond
+  // would reuse an id, the second Map.set would overwrite the first, and
+  // stop(id) would then kill the wrong process while the first leaks.
+  const jobId = `live_${Date.now()}_${++liveJobSeq}`;
+
+  // Chat files sit next to the video under the same base name, so
+  // <handle>_<stamp>.mp4 / .chat.jsonl / .chat.srt travel together.
+  let chat = null;
+  let chatPoll = null;
+  const finishChat = () => {
+    chatPoll = clearDomTimer(chatPoll);
+    if (!chat) return null;
+    const roomId = chat.roomId;
+    const res = livechat.close(roomId);
+    chat = null;
+    liveChatEmitAt.delete(roomId);
+    return res;
+  };
+
+  // Screen mode sources: the guest page for pixels, the best CDN URL (if any)
+  // for the AUDIO track only. The room was re-resolved above, so the URL is
+  // fresh and comes from main's own response, never the renderer's copy.
+  let screenGuest = null;
+  let screenAudioUrl = null;
+  if (mode === 'screen') {
+    const candidates = Array.isArray(resolved.streams) ? resolved.streams : [];
+    const https = candidates.filter((x) => x && typeof x.url === 'string' && /^https?:\/\//i.test(x.url));
+    screenAudioUrl = https.length ? https[0].url : null;
+    try {
+      const wc = webContents.fromId(Number(feedGuestId));
+      screenGuest = wc && !wc.isDestroyed() ? wc : null;
+    } catch (_) {
+      screenGuest = null;
+    }
+    if (!screenGuest) {
+      return { ok: false, error: 'Встроенный браузер не открыт. Откройте эфир во вкладке «Обзор».' };
+    }
+  }
+
+  let started;
+  try {
+    const liveCallbacks = {
+      onProgress: (p) => {
+        if (win && !win.isDestroyed()) win.webContents.send('live:progress', p);
+      },
+      onDone: (r) => {
+        r.chat = finishChat();
+        if (win && !win.isDestroyed()) win.webContents.send('live:done', r);
+      },
+      onError: (message) => {
+        finishChat();
+        if (win && !win.isDestroyed()) win.webContents.send('live:error', { id: jobId, message });
+      },
+    };
+    started =
+      mode === 'screen'
+        ? live.startScreen(jobId, resolved, s, {
+            guest: screenGuest,
+            audioUrl: screenAudioUrl,
+            fps: 10,
+            quality: 70,
+            ...liveCallbacks,
+          })
+        : live.start(jobId, resolved, s, liveCallbacks);
+  } catch (e) {
+    return { ok: false, error: `Не удалось запустить запись: ${e.message || e}` };
+  }
+  if (!started || started.error) {
+    return { ok: false, error: (started && started.error) || 'Не удалось запустить запись.' };
+  }
+
+  if (withChat && resolved.roomId) {
+    // Prime the DOM fallback collector (idempotent no-op if already armed).
+    try {
+      feed.runInGuest(feed.CHAT_WATCH_SCRIPT).catch(() => {});
+    } catch (_) {}
+    // Single guarded ~1s drain timer for this chat session; cleared in
+    // finishChat() and on app teardown. runInGuest never throws, pollDomChat
+    // never throws — a dead guest just yields empty drains.
+    const domRoomId = String(resolved.roomId || '');
+    chatPoll = clearDomTimer(chatPoll);
+    chatPoll = trackDomTimer(
+      setInterval(() => {
+        pollDomChat(domRoomId).catch(() => {});
+      }, 1000)
+    );
+    if (chatPoll && chatPoll.unref) chatPoll.unref();
+    try {
+      chat = livechat.open(
+        {
+          dir: path.dirname(started.path),
+          baseName: path.basename(started.path, '.mp4'),
+          roomId: resolved.roomId,
+          handle: resolved.handle,
+        },
+        // Anchors the subtitle timeline to the video, not to the first message.
+        started.startedAt || Date.now()
+      );
+    } catch (_) {
+      chat = null;
+    }
+    // No sink, no session: do not poll a chat nobody writes to.
+    if (!chat) chatPoll = clearDomTimer(chatPoll);
+  }
+
+  return { ok: true, id: jobId, path: started.path, mode, room: resolved, withChat: Boolean(chat) };
+});
+
+// ---------- live chat plumbing ----------
+//
+// Two sources feed one ChatSink per recording:
+//
+//  1. the guest's own webcast WebSocket, intercepted in the preload and decoded
+//     below (`live:wsFrames`) — complete, with server-side msgId and createTime;
+//  2. the chat column rendered in the page, drained once a second by
+//     `pollDomChat` — best effort, used when the tap is blocked by CSP or the
+//     socket is not there.
+//
+// Both write into the same sink, so they de-duplicate against each other: a
+// text seen on the socket within DOM_DEDUP_MS is dropped when it next shows up
+// in a DOM drain.
+const DOM_DEDUP_MS = 10000;
+const CHAT_EMIT_MS = 1000;
+let chatPoll = null;
+const domPollTimers = new Set();
+const recentChatTexts = new Map();
+
+function trackDomTimer(t) {
+  if (t) domPollTimers.add(t);
+  return t;
+}
+
+/** Returns null so call sites can write `poll = clearDomTimer(poll)`. */
+function clearDomTimer(t) {
+  if (t) {
+    clearInterval(t);
+    domPollTimers.delete(t);
+  }
+  return null;
+}
+
+/** Called from window-all-closed / before-quit; a live interval keeps main up. */
+function stopAllDomPolls() {
+  for (const t of domPollTimers) {
+    try {
+      clearInterval(t);
+    } catch (_) {
+      /* already gone */
+    }
+  }
+  domPollTimers.clear();
+  chatPoll = null;
+  recentChatTexts.clear();
+}
+
+function noteChatText(text) {
+  const key = String(text || '').trim();
+  if (!key) return;
+  const now = Date.now();
+  for (const [k, at] of recentChatTexts) {
+    if (now - at > DOM_DEDUP_MS) recentChatTexts.delete(k);
+  }
+  recentChatTexts.set(key, now);
+}
+
+function seenChatText(text) {
+  const key = String(text || '').trim();
+  if (!key) return false;
+  const at = recentChatTexts.get(key);
+  return at !== undefined && Date.now() - at <= DOM_DEDUP_MS;
+}
+
+/** Throttled per room: the row shows a live count, four updates a second is noise. */
+function emitChatCount(roomId) {
+  const key = String(roomId || '');
+  if (!key || !win || win.isDestroyed()) return;
+  const now = Date.now();
+  if (now - (liveChatEmitAt.get(key) || 0) < CHAT_EMIT_MS) return;
+  liveChatEmitAt.set(key, now);
+  const sink = livechat.status().find((s) => livechat.sameRoom(s.roomId, key));
+  if (!sink) return;
+  win.webContents.send('live:chat', {
+    roomId: key,
+    handle: sink.handle || '',
+    count: sink.count || 0,
+  });
+}
+
+/**
+ * One drain of the page's chat column. Never throws: `runInGuest` resolves to
+ * { ok:false } on every failure, and a dead guest just yields no rows. Anything
+ * the socket already reported in the last DOM_DEDUP_MS is dropped so the two
+ * sources do not double-write the same message.
+ */
+async function pollDomChat(roomId) {
+  const res = await feed.runInGuest(feed.CHAT_DRAIN_SCRIPT, { timeout: 8000 });
+  if (!res || !res.ok || !Array.isArray(res.value) || !res.value.length) return;
+  const out = [];
+  for (const row of res.value) {
+    const text = String((row && row.text) || '').trim();
+    if (!text) continue;
+    if (seenChatText(text)) continue;
+    // The page gives us no server timestamp, so a sane one is used when it is
+    // there and local time otherwise.
+    const raw = Number(row && row.time);
+    const t = raw > 0 && raw < 4e12 ? raw : Date.now();
+    const author = String((row && row.author) || '').trim();
+    out.push({
+      roomId: String(roomId || ''),
+      msgId: '',
+      t,
+      displayId: author,
+      nickname: author,
+      content: text,
+    });
+  }
+  if (!out.length) return;
+  livechat.route(out);
+  emitChatCount(String(roomId || ''));
+}
+
+// Live chat arrives from the guest webview as raw WebSocket frames (see
+// src/preload/webview-preload.js). They are decoded here because the decoder
+// needs zlib and Buffer, neither of which the sandboxed preload can do cheaply,
+// and because this is where the room-to-recording mapping lives.
+//
+// A `send`, not an `invoke`: this fires up to four times a second and nobody
+// waits on a reply.
+let liveChatEmitAt = new Map();
+ipcMain.on('live:wsFrames', (_e, frames) => {
+  if (!Array.isArray(frames) || !frames.length) return;
+  let messages = [];
+  for (const buf of frames) {
+    try {
+      // A frame crosses two IPC hops (postMessage → sendToHost → send) and can
+      // arrive as a plain ArrayBuffer or Uint8Array. eachField() calls
+      // readUInt32LE / readBigUInt64LE, which throw on those and would make the
+      // decode return [] — the fixed-width branches are exactly where a chat
+      // frame's numbers live.
+      const raw = Buffer.isBuffer(buf) ? buf : Buffer.from(buf && (buf.buffer || buf), buf ? (buf.byteOffset || 0) : 0, buf ? (buf.byteLength || 0) : 0);
+      if (!raw.length) continue;
+      for (const m of livechat.decodeFrame(raw)) messages.push(m);
+    } catch (_) {
+      /* one malformed frame must not drop the rest of the batch */
+    }
+  }
+  if (!messages.length) return;
+  // Remember socket texts so the DOM fallback does not duplicate them.
+  for (const m of messages) {
+    if (m && m.content) noteChatText(m.content);
+  }
+  livechat.route(messages);
+
+  // Keyed per room, not off messages[0]: one batch can span two rooms when two
+  // streams are captured at once, and the other counter would never move.
+  const roomIds = new Set(messages.map((m) => m.roomId).filter(Boolean));
+  for (const roomId of roomIds) emitChatCount(roomId);
+});
+
+ipcMain.handle('live:stop', (_e, id) => live.stop(id, 'Остановлено вручную.'));
+ipcMain.handle('live:stopAll', () => ({ stopped: live.stopAll('Остановлено вручную.') }));
+ipcMain.handle('live:status', () => live.status());
 
 ipcMain.handle('yt:probeBatch', async (e, urls) => {
   const s = settings.get();

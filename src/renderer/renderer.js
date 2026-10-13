@@ -669,6 +669,36 @@ async function mountWebview() {
     e.preventDefault();
   });
 
+  // Chat frames intercepted from the guest's own webcast WebSocket. The preload
+  // batches them, so this is a few messages a second, not a firehose. Guarded
+  // because `window.api.live` is absent in a preload that predates the feature,
+  // and a throw here would abort mountWebview() — and with it the webview the
+  // user was waiting for.
+  wv.addEventListener('ipc-message', (e) => {
+    if (!e) return;
+    if (e.channel === 'live:wsFrames') {
+      if (!window.api || !window.api.live) return;
+      if (!Array.isArray(e.args) || !e.args[0]) return;
+      try {
+        window.api.live.sendWsFrames(e.args[0]);
+      } catch (_) {}
+      return;
+    }
+    // The guest preload reports when its WebSocket tap never installed.
+    if (e.channel === 'live:wsDiag') {
+      const diag = (e.args && e.args[0]) || {};
+      console.warn('[live-chat]', JSON.stringify(diag));
+      // armed:true is the tap stats heartbeat (total/matched/messages) —
+      // proof the tap runs, not a failure.
+      if (diag && diag.armed) return;
+      // No toast: the socket tap cannot install on tiktok.com (its CSP blocks
+      // inline scripts and Electron 33.4.11 has no contextBridge.executeInMainWorld),
+      // so this fires on every single page load and would cry wolf forever. Chat
+      // is still recorded — the DOM column watcher in feed.js reads the same
+      // messages off the page. See README «Чат эфира».
+    }
+  });
+
   // Right-click on a video -> native menu with "Скачать видео".
   // Electron 33: context-menu on <webview> does not fire; menu handled by preload.
   // Redundant listener removed.
@@ -681,7 +711,15 @@ async function mountWebview() {
     try {
       if (typeof wv.getWebContentsId !== 'function') return;
       const id = wv.getWebContentsId();
-      if (id) window.api.feed.register(id);
+      if (!id) return;
+      // invoke() returns a promise, so a throwing handler rejects it ASYNCHRONOUSLY
+      // — the try/catch above only ever caught synchronous throws. Without this
+      // catch a failed registration is completely invisible: the webview is on
+      // screen, the button works, and every feed read answers "the embedded
+      // browser is not open".
+      Promise.resolve(window.api.feed.register(id)).catch((e) => {
+        console.error('[feed:register]', e && (e.message || e));
+      });
     } catch (_) {
       /* not ready yet — dom-ready will report */
     }
@@ -806,6 +844,457 @@ window.api.feed.onMenuAction(({ action, url, title, message }) => {
 $('#feedNowBtn').addEventListener('click', () => {
   downloadCurrentFeedVideo().catch((e) => toast(e.message, 'err'));
 });
+
+// ---------- live view ----------
+
+// One resolved broadcast at a time (state.liveRoom) and any number of running
+// captures (state.liveJobs). Both are kept separate on purpose: re-resolving a
+// link must never disturb a capture that is already writing to disk.
+const liveState = {
+  room: null, // last successfully resolved room
+  jobs: new Map(), // id -> { id, element, subEl, stateEl }
+  pickerItems: [], // кандидаты, показанные пользователю на выбор
+  expanded: false, // ручной выбор раскрытия панели
+  autoOpen: false, // панель раскрыта сама: ошибка, кандидаты или идёт запись
+  statusKind: '', // последний тип подсказки: '' | 'warn' | 'err'
+};
+
+function liveTick(startedAt) {
+  const ms = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  const h = String(Math.floor(ms / 3600)).padStart(2, '0');
+  const m = String(Math.floor((ms % 3600) / 60)).padStart(2, '0');
+  const s = String(ms % 60).padStart(2, '0');
+  return `${h}:${m}:${s}`;
+}
+
+function setLiveStatus(text, kind) {
+  const el = $('#liveStatus');
+  liveState.statusKind = kind || '';
+  el.className = `hint${kind ? ' ' + kind : ''}`;
+  el.textContent = text;
+  // Ошибку или предупреждение надо показать, даже если панель свернута.
+  if (kind === 'err' || kind === 'warn') autoOpenLiveDock();
+  else syncLiveDock();
+}
+
+/**
+ * Рекорд-панель по умолчанию свернута в одну строку кнопок: видео должно
+ * получать всю остальную высоту окна. Всё, что ниже строки кнопок, живёт в
+ * #liveExtra с собственным скроллом и капом, поэтому даже длинный список
+ * записей не вытолкнет webview из окна.
+ *
+ * Панель раскрывается сама, когда пользователю есть что прочитать (ошибка,
+ * предупреждение, карточка эфира, список кандидатов) или когда идёт запись.
+ * Свернуть вручную можно только когда ничего не пишется и не показано —
+ * иначе кнопка закрыла бы то, что пользователь обязан увидеть.
+ */
+function syncLiveDock() {
+  const extra = $('#liveExtra');
+  const toggle = $('#liveToggleBtn');
+  if (!extra) return;
+  // Активная запись — единственное, что раскрывает панель НАВСЕГДА: в списке
+  // кнопка «Остановить», и прятать её под кнопку — значит запретить остановить
+  // запись, не сказав об этом.
+  const shown = liveState.expanded || liveState.autoOpen || liveState.jobs.size > 0;
+  extra.classList.toggle('hidden', !shown);
+  if (toggle) {
+    toggle.setAttribute('aria-expanded', shown ? 'true' : 'false');
+    toggle.textContent = shown ? '▴' : '▾';
+    toggle.disabled = liveState.jobs.size > 0;
+    toggle.title = liveState.jobs.size > 0
+      ? 'Пока идёт запись, панель остаётся раскрытой'
+      : 'Настройки записи и идущие записи';
+  }
+  const badge = $('#liveRunBadge');
+  if (badge) {
+    const n = liveState.jobs.size;
+    badge.classList.toggle('hidden', n === 0);
+    badge.textContent = n > 1 ? `запись: ${n}` : 'запись';
+  }
+}
+
+function toggleLiveDock() {
+  // Ручной клик снимает автооткрытие: пользователь, прочитавший подсказку,
+  // вправе вернуть панель в строку кнопок.
+  liveState.expanded = !liveState.expanded;
+  liveState.autoOpen = false;
+  syncLiveDock();
+}
+
+function autoOpenLiveDock() {
+  liveState.autoOpen = true;
+  syncLiveDock();
+}
+
+function renderLiveCard(res) {
+  const card = $('#liveCard');
+  if (!res.ok) {
+    card.classList.add('hidden');
+    if (res.restricted) {
+      setLiveStatus(res.error, 'warn');
+    } else if (res.offline) {
+      setLiveStatus(`${res.error} Появится кнопка, когда автор начнёт эфир — нажмите «Запись трансляции» ещё раз.`, 'warn');
+    } else {
+      setLiveStatus(res.error, 'err');
+    }
+    return;
+  }
+
+  const room = res.room;
+  if (!room || !Array.isArray(room.streams) || !room.streams.length) {
+    liveState.room = null;
+    card.classList.add('hidden');
+    return setLiveStatus('TikTok не отдал ни одного потока для этого эфира.', 'err');
+  }
+  liveState.room = room;
+  const stream = room.streams[0];
+  const quality = stream.resolution || stream.label || stream.kind;
+  const extra = room.streams.length > 1
+    ? ` · доступно качеств: ${room.streams.length}`
+    : '';
+  card.className = 'live-card';
+  card.innerHTML = `
+    <div class="live-thumb"><span class="live-dot">LIVE</span></div>
+    <div class="live-body">
+      <div class="live-title">${escapeHtml(room.title || `Эфир @${room.handle}`)}</div>
+      <div class="live-meta">
+        @${escapeHtml(room.handle)} · ${escapeHtml(quality)} · ${stream.kind.toUpperCase()}${extra}
+        ${room.viewers ? ` · зрителей ${fmtCount(room.viewers)}` : ''}
+      </div>
+    </div>
+    <div class="live-actions">
+      <button id="liveRecordBtn" class="btn primary">Записать</button>
+    </div>
+  `;
+  setLiveStatus('Эфир найден. Можно записывать.');
+  autoOpenLiveDock();
+
+  const recordBtn = $('#liveRecordBtn');
+  recordBtn.addEventListener('click', () => startLiveRecording(room, recordBtn));
+}
+
+/**
+ * Единственная точка входа для кнопки «Запись трансляции».
+ *
+ * Ссылку вводить не нужно: источник — то, что уже показывает встроенный браузер.
+ * Это ровно то, на что жаловался пользователь: раньше кнопка жила на отдельной
+ * вкладке, и запись не имела смысла, пока «Обзор» смотрит в другую сторону.
+ *
+ * Порядок: текущая страница (если это /@ник/live) → иначе компактный выбор из
+ * найденных на странице эфиров. Автовыбор первого видимого НЕ делается: в ленте
+ * постоянно мелькают чужие превью эфиров, и «записал не то» хуже, чем один
+ * дополнительный клик.
+ */
+async function recordCurrentLive() {
+  const btn = $('#liveRecBtn');
+  if (btn) btn.disabled = true;
+  setLiveStatus('Смотрю страницу во встроенном браузере…');
+  try {
+    const res = await window.api.live.detect();
+    if (!res || !res.ok) {
+      return setLiveStatus((res && res.error) || 'Не удалось прочитать страницу.', 'err');
+    }
+
+    if (res.page) {
+      liveState.pickerItems = [];
+      $('#liveCandidates').classList.add('hidden');
+      return await resolveAndRecord(res.page.url);
+    }
+
+    // Не на эфире: показываем то, что нашлось на странице, и ждём выбора.
+    const box = $('#liveCandidates');
+    const items = (res.candidates || []).slice(0, 12).map((c) => ({
+      url: c.url,
+      title: c.title || `@${c.handle}`,
+    }));
+    if (!items.length) {
+      box.classList.add('hidden');
+      return setLiveStatus(
+        'Здесь не видно трансляции. Откройте эфир во встроенном браузере — или нажмите сюда ещё раз на странице профиля автора с эфиром.',
+        'warn'
+      );
+    }
+    liveState.pickerItems = items;
+    box.classList.remove('hidden');
+    autoOpenLiveDock();
+    box.innerHTML =
+      '<div class="hint">Найдено на странице — выберите эфир:</div>' +
+      items
+        .map(
+          (it, i) =>
+            `<button class="cand" data-i="${i}">${escapeHtml(it.title)} <span class="muted">${escapeHtml(it.url)}</span></button>`
+        )
+        .join('');
+    box.querySelectorAll('.cand').forEach((b) => {
+      b.addEventListener('click', () => {
+        const it = liveState.pickerItems[Number(b.dataset.i)];
+        if (it) resolveAndRecord(it.url);
+      });
+    });
+    setLiveStatus('Выберите трансляцию выше — или откройте эфир во встроенном браузере.');
+  } catch (e) {
+    setLiveStatus(e.message || String(e), 'err');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function resolveAndRecord(url) {
+  setLiveStatus('Ищу трансляцию…');
+  try {
+    const res = await window.api.live.resolve(url);
+    $('#liveCandidates').classList.add('hidden');
+    liveState.pickerItems = [];
+    if (!res || !res.ok) {
+      renderLiveCard(res || { ok: false, error: 'Пустой ответ от main-процесса.' });
+      return;
+    }
+    renderLiveCard(res);
+    // Нашли эфир — стартуем сразу, без второго нажатия: кнопка «Записать» в
+    // карточке остаётся как запасной вариант и для перезаписи другого эфира.
+    return startLiveRecording(res.room);
+  } catch (e) {
+    setLiveStatus(e.message || String(e), 'err');
+  }
+}
+
+// One start in flight at a time. A double-click on «Записать» would otherwise
+// spawn a second ffmpeg before the first IPC returns — main's re-resolve makes
+// that start slower, which widens the window rather than closing it.
+let liveStarting = false;
+
+function startLiveRecording(room, btn) {
+  if (liveStarting) return;
+  liveStarting = true;
+  if (btn) btn.disabled = true;
+  const withChat = Boolean($('#liveChatCheck') && $('#liveChatCheck').checked);
+  const mode = $('#liveModeScreen') && $('#liveModeScreen').checked ? 'screen' : 'stream';
+  Promise.resolve()
+    .then(() => window.api.live.start(room, { withChat, mode }))
+    .then((r) => {
+      if (!r || !r.ok) {
+        return toast((r && r.error) || 'Не удалось начать запись.', 'err');
+      }
+      // Prefer main's freshly-resolved room: it may carry a newer title or a
+      // different handle than the card the user is looking at.
+      const job = addLiveJob(r.id, r.room || room, (r && r.mode) || mode);
+      if (job && withChat) job.chat = 0;
+      if (withChat && r.withChat === false) {
+        // main swallowed an error opening the sink. Say so instead of leaving
+        // a recording that looks like it is saving chat and is not.
+        toast(
+          'Чат не пишется: не удалось открыть файл чата. Видео записывается.',
+          'err'
+        );
+      }
+      toast('Запись началась.', 'ok');
+      autoOpenLiveDock();
+    })
+    .catch((e) => toast(e.message || String(e), 'err'))
+    .finally(() => {
+      liveStarting = false;
+      if (btn) btn.disabled = false;
+    });
+}
+
+/**
+ * Single source of truth for the «Идущие записи» panel state.
+ *
+ * Counts ROWS, not `liveState.jobs`: a finished capture is deliberately removed
+ * from that map (it is no longer controllable) but its row stays on screen, so
+ * counting the map would report "0 записей" while rows are plainly visible and
+ * the «Очистить» button would have nothing to act on.
+ */
+function syncLivePanel() {
+  const rows = $('#liveList').children.length;
+  $('#liveStopAllBtn').disabled = liveState.jobs.size === 0;
+  $('#liveClearBtn').disabled = rows === 0;
+  $('#liveCount').textContent = rows ? `· ${rows}` : '';
+  $('#liveEmpty').classList.toggle('hidden', rows > 0);
+  syncLiveDock();
+}
+
+function liveModeLabel(m) {
+  return m === 'screen' ? 'экран' : 'поток';
+}
+
+function addLiveJob(id, room, mode) {
+  if (liveState.jobs.has(id)) return liveState.jobs.get(id);
+  const el = document.createElement('div');
+  el.className = 'job live-job';
+  el.innerHTML = `
+    <div class="job-top">
+      <div class="job-text">
+        <div class="job-title">${escapeHtml(room.title || `Эфир @${room.handle}`)}</div>
+        <div class="job-sub">@${escapeHtml(room.handle)} · ${liveModeLabel(mode)} · подключение…</div>
+      </div>
+      <span class="rec-badge">запись</span>
+      <button class="btn small">Остановить</button>
+    </div>
+  `;
+  const sub = el.querySelector('.job-sub');
+  const stopBtn = el.querySelector('button');
+  stopBtn.addEventListener('click', () => window.api.live.stop(id));
+  $('#liveList').prepend(el);
+
+  const job = {
+    id,
+    element: el,
+    subEl: sub,
+    stopBtn,
+    startedAt: Date.now(),
+    handle: room.handle,
+    mode: mode === 'screen' ? 'screen' : 'stream',
+    // roomId links this row to the chat messages main routes to it.
+    roomId: room.roomId ? String(room.roomId) : '',
+    chat: 0,
+  };
+  liveState.jobs.set(id, job);
+  syncLivePanel();
+  return job;
+}
+
+function dropLiveJob(id) {
+  const job = liveState.jobs.get(id);
+  if (job) job.element.remove();
+  liveState.jobs.delete(id);
+  syncLivePanel();
+}
+
+/**
+ * A finished capture stays in the list as a plain row with a «Показать» button,
+ * exactly like a completed download in the queue. Auto-opening Explorer here
+ * would pop a window for every recording that ends.
+ */
+function finishLiveJob(r) {
+  const job = liveState.jobs.get(r.id);
+  if (!job) return;
+  liveState.jobs.delete(r.id);
+
+  job.element.classList.add('ok');
+  job.element.classList.remove('live-job');
+  const badge = job.element.querySelector('.rec-badge');
+  if (badge) {
+    badge.textContent = 'сохранено';
+    badge.style.animation = 'none';
+    badge.style.background = 'var(--ok)';
+    badge.style.color = '#04220f';
+  }
+  // r.chat is normally the { count, ... } object from main finishChat();
+  // never interpolate it directly — that prints "[object Object]".
+  let chatPart = '';
+  if (r.chat && typeof r.chat === 'object') {
+    chatPart = ` · чата: ${Number(r.chat.count) || 0}`;
+  } else if (typeof r.chat === 'number' && Number.isFinite(r.chat)) {
+    chatPart = ` · чата: ${r.chat}`;
+  }
+  job.subEl.textContent =
+    `@${r.handle || ''} · ${liveModeLabel(r.mode || job.mode)} · ${fmtDuration(r.elapsedSec)} записи · ${fmtBytes(r.size)}` +
+    chatPart +
+    (r.reason ? ` · ${r.reason.charAt(0).toLowerCase() + r.reason.slice(1)}` : '');
+  job.stopBtn.textContent = 'Показать';
+  job.stopBtn.disabled = false;
+  job.stopBtn.onclick = () => window.api.settings.reveal(r.path);
+
+  syncLivePanel();
+  toast(`Запись сохранена: ${r.handle ? '@' + r.handle + ' · ' : ''}${fmtBytes(r.size)}`, 'ok');
+}
+
+// Everything below only WIRES the live tab up. If the preload ever ships without
+// the `live` namespace — a stale preload against a new renderer, or a partially
+// failed update — an unguarded `window.api.live.onProgress(...)` throws a
+// TypeError at module top level, and that aborts the REST of renderer.js
+// including boot(), which blacks out the whole window. This project has been
+// bitten by exactly that shape of bug before, so the wiring is skipped instead.
+if (window.api && window.api.live) {
+  $('#liveRecBtn').addEventListener('click', () => {
+    recordCurrentLive().catch((e) => setLiveStatus(e.message || String(e), 'err'));
+  });
+  $('#liveToggleBtn').addEventListener('click', toggleLiveDock);
+  syncLiveDock();
+  $('#liveStopAllBtn').addEventListener('click', async () => {
+    const n = liveState.jobs.size;
+    if (!n) return;
+    if (!confirm(`Остановить все записи (${n})? Файлы закроются и останутся на диске.`)) return;
+    await window.api.live.stopAll();
+    toast('Записи остановлены');
+  });
+  // «Очистить» empties the LIST ONLY: it drops the rows from #liveList. It never
+  // deletes anything on disk — finished captures stay in <downloadDir>\live\.
+  // The one side effect on the main process is stopping recordings that are
+  // still running, otherwise their rows would vanish while ffmpeg kept writing
+  // to a folder the user can no longer see or stop from the list.
+  $('#liveClearBtn').addEventListener('click', async () => {
+    const rows = Array.from($('#liveList').children);
+    if (!rows.length) return;
+    const active = liveState.jobs.size;
+    if (active > 0) {
+      const go = confirm(
+        `Активных записей: ${active}. Очистить список? ` +
+          'Они будут остановлены, файлы закроются и останутся на диске.'
+      );
+      if (!go) return;
+      await window.api.live.stopAll();
+    }
+    rows.forEach((el) => el.remove());
+    liveState.jobs.clear();
+    syncLivePanel();
+    toast(`Очищено: ${rows.length}`, 'ok');
+  });
+
+  // Mode hint under the radio row: plain words for what each mode records.
+  const syncLiveModeHint = () => {
+    const el = $('#liveModeHint');
+    if (!el) return;
+    el.textContent =
+      $('#liveModeScreen') && $('#liveModeScreen').checked
+        ? 'Записывается окно страницы: видео, зрители и чат — как на экране. Не переключайтесь на другие вкладки и не сворачивайте окно.'
+        : 'Поток: пишется чистое видео эфира с CDN. Качество максимальное. Можно переключаться на другие вкладки.';
+  };
+  if ($('#liveModeStream')) $('#liveModeStream').addEventListener('change', syncLiveModeHint);
+  if ($('#liveModeScreen')) $('#liveModeScreen').addEventListener('change', syncLiveModeHint);
+  syncLiveModeHint();
+
+  window.api.live.onProgress((p) => {
+    const job = liveState.jobs.get(p.id);
+    if (!job) return;
+    const parts = [liveTick(job.startedAt), liveModeLabel(job.mode)];
+    if (p.downloaded) parts.push(fmtBytes(p.downloaded));
+    if (p.resolution) parts.push(p.resolution);
+    if (p.mode === 'screen' && Number.isFinite(p.frames)) parts.push(`кадров: ${p.frames}`);
+    if (job.chat) parts.push(`чата: ${job.chat}`);
+    job.subEl.textContent = `${p.handle ? '@' + p.handle + ' · ' : ''}${parts.join(' · ')}`;
+    // The per-row stop button is deliberately left ENABLED here. Disabling it on
+    // progress made it permanently dead: nothing re-enabled it until the job
+    // finished, so per-recording stop was impossible. live.stop() is idempotent,
+    // so a double click is harmless.
+  });
+
+  // Chat counter. It stays at 0 when nothing is arriving, which is the honest
+  // signal: the capture reads the page's socket, and if the browser is not
+  // sitting on that live room there is nothing to intercept.
+  window.api.live.onChat(({ roomId, count }) => {
+    for (const job of liveState.jobs.values()) {
+      if (roomId && job.roomId && job.roomId !== roomId) continue;
+      job.chat = count;
+    }
+  });
+
+  window.api.live.onDone((r) => {
+    finishLiveJob(r);
+  });
+
+  window.api.live.onError(({ id, message }) => {
+    // A job the user already removed via «Очистить» is gone from the map; its
+    // late error must not pop a toast about a recording that is off the screen.
+    if (!liveState.jobs.has(id)) return;
+    dropLiveJob(id);
+    toast(message || 'Запись прервана', 'err');
+  });
+} else {
+  const box = $('#liveStatus');
+  if (box) box.textContent = 'Запись эфиров недоступна: перезапустите приложение.';
+}
 
 function switchTab(name) {
   $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.view === name));

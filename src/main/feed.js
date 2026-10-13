@@ -226,6 +226,240 @@ const PLAYING_SCRIPT = `(() => {
   return out;
 })()`;
 
+ /**
+  * BEST-EFFORT DOM fallback for live chat. The WebSocket tap (see
+  * src/preload/webview-preload.js) is the primary source; this harvests what
+  * the user SEES in the chat column for the case the socket lives somewhere
+  * unreachable (e.g. opened inside a Worker).
+  *
+  * The selectors are HEURISTIC — TikTok hashes its class names, so this locates
+  * the chat column by its visible text (/зрител|viewer/i) or, failing that, by
+  * the densest short-text container in the right third of the viewport — and
+  * may break on a TikTok redesign. It must NEVER throw into the recording
+  * path: every DOM touch is guarded, and main.js only calls the drain script
+  * through runInGuest(), which itself never throws.
+  *
+  * Self-contained IIFE, idempotent via window.__tkmChatWatch. Rows accumulate
+  * in window.__tkmChat (capped, consecutive-duplicate-free) for
+  * CHAT_DRAIN_SCRIPT to collect.
+  */
+ const CHAT_WATCH_SCRIPT = `(() => {
+   if (window.__tkmChatWatch) return "already";
+   window.__tkmChatWatch = true;
+   if (!window.__tkmChat) window.__tkmChat = [];
+   var MAX = 500;
+   var lastAuthor = "##none##";
+   var lastText = "##none##";
+   var column = null;
+   var columnAt = 0;
+   function isSpace(code) {
+     return code === 9 || code === 10 || code === 13 || code === 32 || code === 160;
+   }
+   function clean(s) {
+     s = String(s == null ? "" : s);
+     var out = "";
+     var pendingSpace = false;
+     var started = false;
+     for (var i = 0; i < s.length; i++) {
+       var code = s.charCodeAt(i);
+       if (isSpace(code)) {
+         if (started) pendingSpace = true;
+         continue;
+       }
+       if (pendingSpace) {
+         out += " ";
+         pendingSpace = false;
+       }
+       out += s.charAt(i);
+       started = true;
+     }
+     return out;
+   }
+   function push(author, text) {
+     author = clean(author);
+     text = clean(text);
+     if (!text) return;
+     if (text.length > 300) text = text.slice(0, 300);
+     if (author === lastAuthor && text === lastText) return;
+     lastAuthor = author;
+     lastText = text;
+     var arr = window.__tkmChat;
+     arr.push({ text: text, author: author, time: Date.now() });
+     if (arr.length > MAX) arr.splice(0, arr.length - MAX);
+   }
+   function authorOf(el) {
+     try {
+       var cand = el.querySelector("b, strong, a");
+       if (cand) {
+         var name = clean(cand.textContent);
+         if (name && name.length <= 60) return name;
+       }
+     } catch (_) {}
+     return "";
+   }
+   function rowText(el) {
+     try {
+       if (typeof el.innerText === "string") return el.innerText;
+       return el.textContent || "";
+     } catch (_) {
+       return "";
+     }
+   }
+   function findColumn() {
+     var all = null;
+     try {
+       all = document.querySelectorAll("div");
+     } catch (_) {
+       return null;
+     }
+     var i, el, t;
+     var best = null;
+     var bestLen = 0;
+     for (i = 0; i < all.length; i++) {
+       el = all[i];
+       try {
+         t = el.innerText || "";
+       } catch (_) {
+         continue;
+       }
+       if (!t) continue;
+       if (/зрител|viewer/i.test(t.slice(0, 2000))) {
+         if (best === null || t.length < bestLen) {
+           best = el;
+           bestLen = t.length;
+         }
+       }
+     }
+     if (best) return best;
+     var vw = 1280;
+     try {
+       vw = window.innerWidth || 1280;
+     } catch (_) {}
+     var bestEl = null;
+     var bestScore = 0;
+     for (i = 0; i < all.length; i++) {
+       el = all[i];
+       var r = null;
+       try {
+         r = el.getBoundingClientRect();
+       } catch (_) {
+         continue;
+       }
+       if (!r || r.width <= 0 || r.height <= 0) continue;
+       if (r.left < vw * 0.66) continue;
+       var kids = null;
+       try {
+         kids = el.children;
+       } catch (_) {
+         continue;
+       }
+       if (!kids || !kids.length) continue;
+       var short = 0;
+       var lim = kids.length > 50 ? 50 : kids.length;
+       for (var k = 0; k < lim; k++) {
+         var kt = "";
+         try {
+           kt = clean(kids[k].innerText);
+         } catch (_) {
+           continue;
+         }
+         if (kt && kt.length <= 200) short++;
+       }
+       if (short > bestScore) {
+         bestScore = short;
+         bestEl = el;
+       }
+     }
+     return bestScore > 0 ? bestEl : null;
+   }
+   function getColumn() {
+     var now = 0;
+     try {
+       now = Date.now();
+     } catch (_) {}
+     if (column && column.isConnected && now - columnAt < 10000) return column;
+     column = findColumn();
+     columnAt = now;
+     return column;
+   }
+   function harvestNode(node, depth) {
+     if (!node || node.nodeType !== 1) return;
+     if (depth > 6) return;
+     var tag = "";
+     try {
+       tag = node.tagName || "";
+     } catch (_) {
+       return;
+     }
+     if (tag === "SCRIPT" || tag === "STYLE" || tag === "VIDEO" || tag === "IMG" || tag === "SVG") return;
+     var col = getColumn();
+     if (col) {
+       var inCol = false;
+       try {
+         inCol = col.contains(node);
+       } catch (_) {
+         inCol = false;
+       }
+       if (!inCol) {
+         var wrapsCol = false;
+         try {
+           wrapsCol = node.contains(col);
+         } catch (_) {
+           wrapsCol = false;
+         }
+         if (!wrapsCol) return;
+       }
+     }
+     var text = clean(rowText(node));
+     if (text && text.length <= 300) {
+       push(authorOf(node), text);
+       return;
+     }
+     var kids = null;
+     try {
+       kids = node.children;
+     } catch (_) {
+       return;
+     }
+     if (!kids) return;
+     for (var i = 0; i < kids.length; i++) harvestNode(kids[i], depth + 1);
+   }
+   var obs = null;
+   try {
+     obs = new MutationObserver(function (muts) {
+       try {
+         for (var i = 0; i < muts.length; i++) {
+           var added = muts[i].addedNodes;
+           if (!added) continue;
+           for (var j = 0; j < added.length; j++) harvestNode(added[j], 0);
+         }
+       } catch (_) {}
+     });
+   } catch (_) {
+     return "no-observer";
+   }
+   try {
+     obs.observe(document.body, { childList: true, subtree: true });
+   } catch (_) {
+     try {
+       obs.observe(document.documentElement, { childList: true, subtree: true });
+     } catch (_) {
+       return "no-body";
+     }
+   }
+   return "installed";
+ })()`;
+
+ /**
+  * Returns window.__tkmChat and clears it. Run via runInGuest() (CSP-immune
+  * main-world executeJavaScript), so it works even where page CSP blocks every
+  * other injection channel.
+  */
+ const CHAT_DRAIN_SCRIPT = `(() => {
+   var a = window.__tkmChat || [];
+   window.__tkmChat = [];
+   return a;
+ })()`;
 async function installHooks() {
   const res = await runInGuest(HOOK_SCRIPT);
   return res.ok ? res.value : null;
@@ -576,10 +810,71 @@ async function currentPlaying() {
   return { ok: true, video: v };
 }
 
+/**
+ * Finds LIVE broadcasts reachable from the page currently open in the embedded
+ * browser: the room the user navigated to, plus every live link the feed
+ * happens to render.
+ *
+ * Read-only and cheap by design. The actual media URL is NOT resolved here: a
+ * cross-origin fetch to webcast.tiktok.com from inside the page is blocked by
+ * CORS, so src/main/live.js does that over the main-process session instead,
+ * which also carries the user's proxy.
+ */
+const LIVE_SCRIPT = `(() => {
+  const out = { page: null, candidates: [] };
+
+  const onLive = (location.pathname || '').match(/\\/@([A-Za-z0-9._-]+)\\/live(?:\\/(\\d{5,}))?/i);
+  if (onLive) {
+    out.page = {
+      handle: onLive[1],
+      roomId: onLive[2] || '',
+      url: location.origin + location.pathname,
+    };
+  }
+
+  const seen = new Map();
+  const anchors = document.querySelectorAll('a[href*="/live"]');
+  for (const a of anchors) {
+    const href = a.getAttribute('href') || '';
+    const m = href.match(/\\/@([A-Za-z0-9._-]+)\\/live(?:\\/(\\d{5,}))?/i);
+    if (!m) continue;
+    const key = m[1].toLowerCase();
+    if (seen.has(key)) continue;
+    const r = a.getBoundingClientRect();
+    const onScreen =
+      r.width > 0 && r.height > 0 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
+    seen.set(key, {
+      handle: m[1],
+      roomId: m[2] || '',
+      url: 'https://www.tiktok.com/@' + m[1] + '/live',
+      title: (a.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 80),
+      visible: onScreen,
+    });
+  }
+
+  // On-screen links first: those are the broadcasts the user is looking at.
+  out.candidates = [...seen.values()]
+    .sort((x, y) => (x.visible === y.visible ? 0 : x.visible ? -1 : 1))
+    .slice(0, 40);
+  return out;
+})()`;
+
+async function detectLive() {
+  const res = await runInGuest(LIVE_SCRIPT, { timeout: 12000 });
+  if (!res.ok) return res;
+  const v = res.value || {};
+  return {
+    ok: true,
+    page: v.page || null,
+    candidates: Array.isArray(v.candidates) ? v.candidates : [],
+  };
+}
+
 module.exports = {
   collect,
   currentVideo,
   currentPlaying,
+  detectLive,
   installHooks,
   runInGuest,
   setWebviewId,
@@ -587,5 +882,8 @@ module.exports = {
   SCROLL_SCRIPT,
   CURRENT_SCRIPT,
   PLAYING_SCRIPT,
+  LIVE_SCRIPT,
   HOOK_SCRIPT,
+  CHAT_WATCH_SCRIPT,
+  CHAT_DRAIN_SCRIPT,
 };

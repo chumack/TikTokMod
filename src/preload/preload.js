@@ -43,6 +43,25 @@ contextBridge.exposeInMainWorld('api', {
     guestPreloadUrl: () => invoke('feed:guestPreloadUrl'),
     onMenuAction: (cb) => on('feed:menuAction', cb),
   },
+  live: {
+    resolve: (input) => invoke('live:resolve', input),
+    detect: () => invoke('live:detect'),
+    // `opts` carries `{ withChat }`. Dropping it here silently killed chat: the
+    // main handler's second parameter would always be `{}`, so the ChatSink was
+    // never opened and no .chat.* files were written, with no error anywhere.
+    start: (room, opts) => invoke('live:start', room, opts),
+    stop: (id) => invoke('live:stop', id),
+    stopAll: () => invoke('live:stopAll'),
+    status: () => invoke('live:status'),
+    // High-frequency one-way path for intercepted chat frames, so it is a send
+    // rather than an invoke: nothing waits on a reply, and an unhandled invoke
+    // rejection on every frame would be noise in a busy room.
+    sendWsFrames: (frames) => ipcRenderer.send('live:wsFrames', frames),
+    onProgress: (cb) => on('live:progress', cb),
+    onDone: (cb) => on('live:done', cb),
+    onError: (cb) => on('live:error', cb),
+    onChat: (cb) => on('live:chat', cb),
+  },
   geo: {
     inspect: () => invoke('geo:inspect'),
     profiles: () => invoke('geo:profiles'),

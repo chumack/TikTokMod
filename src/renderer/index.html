@@ -105,12 +105,51 @@
         <div id="browserHost" class="webview-host"></div>
       </div>
 
-      <!-- Намеренно компактная панель: только кнопка. Заголовок «Скачивание из
-           ленты» и подсказка #feedStatus удалены — они растягивали панель во всю
-           ширину окна и съедали ~35px высоты видео. Теперь панель обтекает кнопку
-           (см. .feed-panel в styles.css), её ширина задаётся содержимым. -->
-      <div class="panel feed-panel">
-        <button id="feedNowBtn" class="btn primary">Скачать текущее видео</button>
+      <!-- Нижняя панель «Обзора» держит и скачивание, и запись эфира — раньше
+           запись жила на отдельной вкладке, до которой надо было переключаться,
+           а кнопка записи не работала, пока встроенный браузер смотрит в другую
+           сторону. Теперь всё в одном месте, ровно там, куда смотрит пользователь.
+
+           Свёрнутое состояние — одна строка кнопок (~55px): видео получает всю
+           остальную высоту. Всё остальное живёт в #liveExtra с собственным скроллом
+           и капом, поэтому длинный список записей не может вытолкнуть видео из
+           окна. Разворачивается само при старте записи и по кнопке-шеврону. -->
+      <div class="panel feed-panel live-dock" id="liveDock">
+        <div class="live-bar">
+          <button id="feedNowBtn" class="btn primary">Скачать текущее видео</button>
+          <button id="liveRecBtn" class="btn primary" title="Записать трансляцию, которую сейчас показывает встроенный браузер">Запись трансляции</button>
+          <button id="liveToggleBtn" class="btn small ghost" aria-expanded="false" aria-controls="liveExtra" title="Настройки записи и идущие записи">▾</button>
+          <span id="liveRunBadge" class="rec-badge hidden" title="Идёт запись"></span>
+        </div>
+
+        <div id="liveExtra" class="live-extra hidden">
+          <div class="row live-opts">
+            <div class="row live-mode" role="radiogroup" aria-label="Режим записи эфира">
+              <label class="check"><input id="liveModeStream" type="radio" name="liveMode" value="stream" checked /> Поток (чистое видео)</label>
+              <label class="check"><input id="liveModeScreen" type="radio" name="liveMode" value="screen" /> Экран (как на странице)</label>
+            </div>
+            <label class="check" title="Чат берётся из подключения, уже открытого встроенным браузером на этом эфире — держите «Обзор» открытым на трансляции."><input id="liveChatCheck" type="checkbox" checked /> с чатом</label>
+          </div>
+          <div id="liveModeHint" class="hint">Поток: пишется чистое видео эфира с CDN. Качество максимальное. Можно переключаться на другие вкладки.</div>
+          <div id="liveStatus" class="hint">Откройте трансляцию во встроенном браузере и нажмите «Запись трансляции». Файлы попадают в подпапку <b>live</b> папки загрузок.</div>
+
+          <div id="liveCard" class="live-card hidden"></div>
+          <div id="liveCandidates" class="live-cands hidden"></div>
+
+          <div class="live-jobs">
+            <div class="panel-head">
+              <h2>Идущие записи <span id="liveCount" class="muted"></span></h2>
+              <div class="row">
+                <button id="liveStopAllBtn" class="btn small" disabled>Остановить всё</button>
+                <!-- «Очистить» удаляет ТОЛЬКО строки из списка записей. Файлы на диске и
+                     папку live он не трогает: уже записанные эфиры остаются на месте. -->
+                <button id="liveClearBtn" class="btn small" disabled>Очистить</button>
+              </div>
+            </div>
+            <div id="liveList" class="queue"></div>
+            <div class="empty" id="liveEmpty">Записей нет</div>
+          </div>
+        </div>
       </div>
     </section>
 

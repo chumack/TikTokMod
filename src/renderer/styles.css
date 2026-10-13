@@ -132,6 +132,53 @@ main { flex: 1 1 auto; overflow: hidden; position: relative; }
    primary button is the worst possible failure here. */
 #view-browser > .panel.feed-panel > .btn { white-space: normal; min-width: 0; }
 
+/* ---------- live dock (низ «Обзора») ----------
+   The panel ABOVE keeps `align-self: flex-end` and `max-width: 100%`; everything
+   here is about the dock's INTERNAL layout only. Nothing in this block may set
+   `align-self`, `width: 100%` or `margin: 0 auto` on `.feed-panel` itself — that
+   would re-stretch the panel across the window and undo the compact right-hand
+   dock (see the DO-NOT-REVERT comment above). */
+#view-browser > .panel.feed-panel.live-dock {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  /* The dock can now be taller than a single button row, so it needs a real
+     width budget instead of shrink-to-fit against the video: it grows to the
+     widest child but never past the window. */
+  width: max-content;
+}
+.live-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+/* Same reason as the rule above this block: `nowrap` on `.btn` makes the
+   min-content width equal the full label, and on a narrow window that beats
+   `max-width: 100%` and gets clipped by `#view-browser.active { overflow:
+   hidden }`. Wrapping turns a clipped button into one extra line. */
+.live-bar .btn { white-space: normal; min-width: 0; }
+/* The chevron is the last item on the right, so the dock can grow leftwards
+   without pushing it out of reach. */
+#liveToggleBtn { margin-left: auto; }
+/* Scroll cap. `#view-browser` is `overflow:hidden` with `.browser-panel
+   { flex:1 1 auto }` above, and the dock is `flex:0 0 auto` — so an unbounded
+   dock would squeeze the webview to zero height instead of scrolling. The cap
+   turns "video disappears" into "this part scrolls". */
+.live-extra {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  max-height: 38vh;
+  overflow-y: auto;
+}
+.live-opts { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin: 0; }
+.live-opts .live-mode { margin: 0; }
+.live-extra > .hint { margin: 0; }
+.live-extra > .live-card,
+.live-extra > .live-cands { margin-top: 0; }
+.live-jobs > .panel-head { margin-bottom: 8px; }
+.live-jobs > .panel-head h2 { font-size: 13px; }
+/* Its own cap INSIDE the dock's cap: a long recording history must not push the
+   option row and the status line out of the dock. */
+#liveExtra #liveList { max-height: 120px; overflow-y: auto; }
+
 /* Wide windows: the settings panels are far taller than the viewport, so put
    them side by side instead of one long column. `align-items: start` keeps each
    panel at its natural height rather than stretching it to match its neighbour.
@@ -290,6 +337,94 @@ input[type="number"] { max-width: 140px; }
 .card .cap b { color: var(--text); display: block; font-size: 12px; }
 .card .cap .ok-mark { color: var(--ok); }
 .card .cap .err-mark { color: var(--err); }
+
+/* ---------- live ---------- */
+.live-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-top: 12px;
+}
+/* The cover URL is fetched over the main session, which the renderer cannot do,
+   so the slot is a labelled badge instead of an <img>. */
+.live-thumb {
+  flex: 0 0 auto;
+  width: 58px;
+  height: 58px;
+  border-radius: 8px;
+  background: #000;
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.live-dot {
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .5px;
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.live-body { flex: 1 1 auto; min-width: 0; }
+.live-title { font-size: 13px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-meta { color: var(--muted); font-size: 11px; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.live-actions { flex: 0 0 auto; display: flex; gap: 8px; }
+/* Checkbox line. `.check` is reused by any future plain on/off option; the
+   input is kept at the default size because shrinking it below the platform
+   hit target makes it hard to click, and the panel has plenty of room. */
+.check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 10px 0 6px;
+  font-size: 13px;
+  user-select: none;
+  cursor: pointer;
+}
+.check input { margin: 0; cursor: pointer; }
+/* Mode selector: two radios sharing the .check look (same hit target, same muted
+   13px label); the row itself only lays them out side by side with a wrap. */
+.live-mode { display: flex; gap: 18px; flex-wrap: wrap; margin: 10px 0 6px; }
+.live-mode .check { margin: 0; }
+.live-cands { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
+.cand {
+  text-align: left;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 7px 10px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cand:hover { border-color: var(--accent); }
+.rec-badge {
+  flex: 0 0 auto;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: .5px;
+  padding: 3px 7px;
+  border-radius: 4px;
+  animation: recPulse 1.6s ease-in-out infinite;
+}
+@keyframes recPulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .rec-badge { animation: none; } }
+/* A live capture has no total length, so there is no .bar: the elapsed clock and
+   the byte counter are the progress. */
+.live-job .job-text { flex: 1 1 auto; min-width: 0; }
 
 /* ---------- browser ---------- */
 .browser-panel { display: flex; flex-direction: column; width: 100%; }
