@@ -53,10 +53,13 @@ contextBridge.exposeInMainWorld('api', {
     stop: (id) => invoke('live:stop', id),
     stopAll: () => invoke('live:stopAll'),
     status: () => invoke('live:status'),
-    // High-frequency one-way path for intercepted chat frames, so it is a send
-    // rather than an invoke: nothing waits on a reply, and an unhandled invoke
-    // rejection on every frame would be noise in a busy room.
-    sendWsFrames: (frames) => ipcRenderer.send('live:wsFrames', frames),
+    // Live chat frames no longer come through here: the guest's WebSocket tap
+    // is installed by main in the page's main world and hands frames to main
+    // over its own IPC, so the renderer is not on the path (see
+    // chatTapMainWorld in src/main/main.js).
+    // Last known tap counters — total/matched/messages/frames — for telling
+    // "the room was quiet" apart from "the tap is dead".
+    wsStats: () => invoke('live:wsStats'),
     onProgress: (cb) => on('live:progress', cb),
     onDone: (cb) => on('live:done', cb),
     onError: (cb) => on('live:error', cb),

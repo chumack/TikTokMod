@@ -669,35 +669,20 @@ async function mountWebview() {
     e.preventDefault();
   });
 
-  // Chat frames intercepted from the guest's own webcast WebSocket. The preload
-  // batches them, so this is a few messages a second, not a firehose. Guarded
-  // because `window.api.live` is absent in a preload that predates the feature,
-  // and a throw here would abort mountWebview() — and with it the webview the
-  // user was waiting for.
-  wv.addEventListener('ipc-message', (e) => {
-    if (!e) return;
-    if (e.channel === 'live:wsFrames') {
-      if (!window.api || !window.api.live) return;
-      if (!Array.isArray(e.args) || !e.args[0]) return;
-      try {
-        window.api.live.sendWsFrames(e.args[0]);
-      } catch (_) {}
-      return;
-    }
-    // The guest preload reports when its WebSocket tap never installed.
-    if (e.channel === 'live:wsDiag') {
-      const diag = (e.args && e.args[0]) || {};
-      console.warn('[live-chat]', JSON.stringify(diag));
-      // armed:true is the tap stats heartbeat (total/matched/messages) —
-      // proof the tap runs, not a failure.
-      if (diag && diag.armed) return;
-      // No toast: the socket tap cannot install on tiktok.com (its CSP blocks
-      // inline scripts and Electron 33.4.11 has no contextBridge.executeInMainWorld),
-      // so this fires on every single page load and would cry wolf forever. Chat
-      // is still recorded — the DOM column watcher in feed.js reads the same
-      // messages off the page. See README «Чат эфира».
-    }
-  });
+  // Chat frames used to be relayed from here: the guest preload's
+  // sendToHost() lands on this DOM event, and it was forwarded to main with
+  // api.live.sendWsFrames(). Both halves are gone.
+  //
+  // The tap is injected by MAIN into the guest's main world (see
+  // chatTapMainWorld in src/main/main.js — a preload-side tap cannot work here)
+  // and its frames leave the guest through the `__tkmChat` contextBridge hop in
+  // src/preload/webview-preload.js, which ipcRenderer.send()s them straight to
+  // ipcMain. Nothing about chat frames crosses this process any more, and no
+  // <webview> 'ipc-message' listener is needed for it.
+  //
+  // The «чата: N» counter is NOT dead with it: api.live.onChat (live:chat)
+  // still fires, because the DOM fallback in feed.js drains the chat column and
+  // main still emits live:chat for whichever source produced the message.
 
   // Right-click on a video -> native menu with "Скачать видео".
   // Electron 33: context-menu on <webview> does not fire; menu handled by preload.
@@ -852,10 +837,8 @@ $('#feedNowBtn').addEventListener('click', () => {
 // link must never disturb a capture that is already writing to disk.
 const liveState = {
   room: null, // last successfully resolved room
-  jobs: new Map(), // id -> { id, element, subEl, stateEl }
-  pickerItems: [], // кандидаты, показанные пользователю на выбор
-  expanded: false, // ручной выбор раскрытия панели
-  autoOpen: false, // панель раскрыта сама: ошибка, кандидаты или идёт запись
+  jobs: new Map(), // id -> { id, chipEl, textEl, btnEl, ... }
+  pickerItems: [], // кандидаты, показанные пользователю чипами на выбор
   statusKind: '', // последний тип подсказки: '' | 'warn' | 'err'
 };
 
@@ -869,108 +852,133 @@ function liveTick(startedAt) {
 
 function setLiveStatus(text, kind) {
   const el = $('#liveStatus');
-  liveState.statusKind = kind || '';
-  el.className = `hint${kind ? ' ' + kind : ''}`;
+  if (!el) return;
+  liveState.statusKind = kind === 'err' ? 'err' : '';
+  // Ошибка отмечается ЦВЕТОМ в той же строке, а не отдельным блоком: строка
+  // статуса обрезается по ширине, панель от этого не растёт по высоте.
+  el.classList.toggle('is-err', liveState.statusKind === 'err');
   el.textContent = text;
-  // Ошибку или предупреждение надо показать, даже если панель свернута.
-  if (kind === 'err' || kind === 'warn') autoOpenLiveDock();
-  else syncLiveDock();
 }
 
 /**
- * Рекорд-панель по умолчанию свернута в одну строку кнопок: видео должно
- * получать всю остальную высоту окна. Всё, что ниже строки кнопок, живёт в
- * #liveExtra с собственным скроллом и капом, поэтому даже длинный список
- * записей не вытолкнет webview из окна.
+ * Единственное, чем панель «Обзора» показывает, что идёт запись.
  *
- * Панель раскрывается сама, когда пользователю есть что прочитать (ошибка,
- * предупреждение, карточка эфира, список кандидатов) или когда идёт запись.
- * Свернуть вручную можно только когда ничего не пишется и не показано —
- * иначе кнопка закрыла бы то, что пользователь обязан увидеть.
+ * Никаких раскрывающихся блоков и списков: панель всегда одна строка, потому
+ * что встроенный браузер (гость) должен получать одну и ту же высоту вьюпорта —
+ * иначе геометрия, замороженная при старте записи «Экран», перестаёт совпадать
+ * с текущей, и кадр выходит обрезанным по краям.
  */
 function syncLiveDock() {
-  const extra = $('#liveExtra');
-  const toggle = $('#liveToggleBtn');
-  if (!extra) return;
-  // Активная запись — единственное, что раскрывает панель НАВСЕГДА: в списке
-  // кнопка «Остановить», и прятать её под кнопку — значит запретить остановить
-  // запись, не сказав об этом.
-  const shown = liveState.expanded || liveState.autoOpen || liveState.jobs.size > 0;
-  extra.classList.toggle('hidden', !shown);
-  if (toggle) {
-    toggle.setAttribute('aria-expanded', shown ? 'true' : 'false');
-    toggle.textContent = shown ? '▴' : '▾';
-    toggle.disabled = liveState.jobs.size > 0;
-    toggle.title = liveState.jobs.size > 0
-      ? 'Пока идёт запись, панель остаётся раскрытой'
-      : 'Настройки записи и идущие записи';
-  }
   const badge = $('#liveRunBadge');
+  const n = liveState.jobs.size;
   if (badge) {
-    const n = liveState.jobs.size;
     badge.classList.toggle('hidden', n === 0);
     badge.textContent = n > 1 ? `запись: ${n}` : 'запись';
   }
-}
-
-function toggleLiveDock() {
-  // Ручной клик снимает автооткрытие: пользователь, прочитавший подсказку,
-  // вправе вернуть панель в строку кнопок.
-  liveState.expanded = !liveState.expanded;
-  liveState.autoOpen = false;
-  syncLiveDock();
+  // Состояние кнопки «Очистить» ставится ЗДЕСЬ, а не в обработчике клика: иначе
+  // кнопка рассинхронизируется с чипами (появился чип — она осталась выключенной).
+  // Пока идёт хотя бы одна запись — неактивна: сносить идущий чип вместе с
+  // завершёнными нельзя. Завершённые чипы из liveState.jobs уже удалены
+  // (finishLiveJob), поэтому «есть что чистить» считается по DOM, а не по Map.
+  const clearBtn = $('#liveClearBtn');
+  if (clearBtn) {
+    const box = $('#liveChips');
+    const chips = box ? box.querySelectorAll('.live-chip').length : 0;
+    clearBtn.disabled = n > 0 || chips === 0;
+  }
 }
 
 function autoOpenLiveDock() {
-  liveState.autoOpen = true;
-  syncLiveDock();
+  // Панель больше не раскрывается: она всегда одна строка постоянной высоты.
+  // Функция оставлена как no-op, чтобы существующие вызовы не ломались.
 }
 
+/**
+ * Что будет записано — одной строкой в #liveStatus.
+ *
+ * Карточки с обложкой больше нет: любая обёртка в несколько строк отдавала
+ * панель высотой больше одной строки. Длинный текст обрезается по ширине
+ * стилями `.live-status`, кнопка «Записать» не нужна — запись стартует сразу
+ * после resolve.
+ */
 function renderLiveCard(res) {
-  const card = $('#liveCard');
-  if (!res.ok) {
-    card.classList.add('hidden');
-    if (res.restricted) {
-      setLiveStatus(res.error, 'warn');
-    } else if (res.offline) {
-      setLiveStatus(`${res.error} Появится кнопка, когда автор начнёт эфир — нажмите «Запись трансляции» ещё раз.`, 'warn');
-    } else {
-      setLiveStatus(res.error, 'err');
+  if (!res || !res.ok) {
+    if (res && res.restricted) {
+      return setLiveStatus(res.error || 'Эфир недоступен.', 'warn');
     }
-    return;
+    if (res && res.offline) {
+      return setLiveStatus(
+        `${res.error || ''} Появится чип, когда автор начнёт эфир — нажмите «Запись трансляции» ещё раз.`,
+        'warn'
+      );
+    }
+    return setLiveStatus((res && res.error) || 'Эфир не найден.', 'err');
   }
 
   const room = res.room;
   if (!room || !Array.isArray(room.streams) || !room.streams.length) {
     liveState.room = null;
-    card.classList.add('hidden');
     return setLiveStatus('TikTok не отдал ни одного потока для этого эфира.', 'err');
   }
   liveState.room = room;
-  const stream = room.streams[0];
-  const quality = stream.resolution || stream.label || stream.kind;
-  const extra = room.streams.length > 1
-    ? ` · доступно качеств: ${room.streams.length}`
-    : '';
-  card.className = 'live-card';
-  card.innerHTML = `
-    <div class="live-thumb"><span class="live-dot">LIVE</span></div>
-    <div class="live-body">
-      <div class="live-title">${escapeHtml(room.title || `Эфир @${room.handle}`)}</div>
-      <div class="live-meta">
-        @${escapeHtml(room.handle)} · ${escapeHtml(quality)} · ${stream.kind.toUpperCase()}${extra}
-        ${room.viewers ? ` · зрителей ${fmtCount(room.viewers)}` : ''}
-      </div>
-    </div>
-    <div class="live-actions">
-      <button id="liveRecordBtn" class="btn primary">Записать</button>
-    </div>
-  `;
-  setLiveStatus('Эфир найден. Можно записывать.');
-  autoOpenLiveDock();
+  const title = room.title || `Эфир @${room.handle}`;
+  const viewers = room.viewers ? ` · ${fmtCount(room.viewers)} зрителей` : '';
+  setLiveStatus(`@${room.handle} · ${title}${viewers}`);
+}
 
-  const recordBtn = $('#liveRecordBtn');
-  recordBtn.addEventListener('click', () => startLiveRecording(room, recordBtn));
+/**
+ * Эфиры, найденные на текущей странице, рисуются чипами в общей строке
+ * #liveChips. Кандидаты и идущие записи делят одну строку, поэтому чипы
+ * кандидатов помечены классом .live-cand и снимаются точечно — записи в
+ * #liveChips при этом не трогаются.
+ */
+function renderLiveCandidates(items) {
+  const box = $('#liveChips');
+  if (!box) return;
+  clearLiveCandidates();
+  liveState.pickerItems = items;
+  items.forEach((it) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'live-chip live-cand';
+    b.textContent = '@' + it.handle;
+    b.title = it.title ? `${it.title} — ${it.url}` : it.url;
+    b.addEventListener('click', () => {
+      clearLiveCandidates();
+      resolveAndRecord(it.url);
+    });
+    box.appendChild(b);
+  });
+  syncLiveDock();
+}
+
+function clearLiveCandidates() {
+  liveState.pickerItems = [];
+  const box = $('#liveChips');
+  if (box) Array.from(box.querySelectorAll('.live-cand')).forEach((el) => el.remove());
+  syncLiveDock();
+}
+
+/**
+ * «Очистить» снимает все чипы из строки #liveChips — и завершённые, и чипы
+ * кандидатов — и чистит связанное состояние. Файлы на диске не трогаются: кнопка
+ * «Показать» исчезает вместе с чипом, а сам файл остаётся там, куда его положил
+ * ffmpeg.
+ *
+ * Пока идёт запись, кнопка неактивна (это решает syncLiveDock), но проверка
+ * продублирована: выключенная кнопка — ещё не гарантия, что её никто не вызовет.
+ */
+function clearLiveChips() {
+  if (liveState.jobs.size > 0) return toast('Сначала остановите запись', 'err');
+  clearLiveCandidates();
+  const box = $('#liveChips');
+  const removed = box ? box.children.length : 0;
+  // textContent вместо remove() по каждому чипу: заодно убирает текстовые узлы
+  // и всё, что могло остаться в строке от прошлых отрисовок.
+  if (box) box.textContent = '';
+  liveState.jobs.clear();
+  syncLiveDock();
+  toast(removed ? `Очищено записей: ${removed}` : 'Список записей и так пуст', 'ok');
 }
 
 /**
@@ -995,43 +1003,31 @@ async function recordCurrentLive() {
       return setLiveStatus((res && res.error) || 'Не удалось прочитать страницу.', 'err');
     }
 
-    if (res.page) {
-      liveState.pickerItems = [];
-      $('#liveCandidates').classList.add('hidden');
-      return await resolveAndRecord(res.page.url);
+    const page = res.page || null;
+    const pageHandle = page && page.handle ? String(page.handle).toLowerCase() : '';
+    // Кандидат с тем же @ником, что и текущая страница, — это и есть тот эфир,
+    // на котором пользователь уже стоит: он записывается сразу, клик не нужен.
+    const items = (Array.isArray(res.candidates) ? res.candidates : [])
+      .filter((c) => c && c.url)
+      .filter((c) => !pageHandle || String(c.handle || '').toLowerCase() !== pageHandle)
+      .slice(0, 6)
+      .map((c) => ({ url: c.url, handle: c.handle || '', title: c.title || '' }));
+
+    if (page) {
+      clearLiveCandidates();
+      return await resolveAndRecord(page.url);
     }
 
     // Не на эфире: показываем то, что нашлось на странице, и ждём выбора.
-    const box = $('#liveCandidates');
-    const items = (res.candidates || []).slice(0, 12).map((c) => ({
-      url: c.url,
-      title: c.title || `@${c.handle}`,
-    }));
     if (!items.length) {
-      box.classList.add('hidden');
+      clearLiveCandidates();
       return setLiveStatus(
         'Здесь не видно трансляции. Откройте эфир во встроенном браузере — или нажмите сюда ещё раз на странице профиля автора с эфиром.',
         'warn'
       );
     }
-    liveState.pickerItems = items;
-    box.classList.remove('hidden');
-    autoOpenLiveDock();
-    box.innerHTML =
-      '<div class="hint">Найдено на странице — выберите эфир:</div>' +
-      items
-        .map(
-          (it, i) =>
-            `<button class="cand" data-i="${i}">${escapeHtml(it.title)} <span class="muted">${escapeHtml(it.url)}</span></button>`
-        )
-        .join('');
-    box.querySelectorAll('.cand').forEach((b) => {
-      b.addEventListener('click', () => {
-        const it = liveState.pickerItems[Number(b.dataset.i)];
-        if (it) resolveAndRecord(it.url);
-      });
-    });
-    setLiveStatus('Выберите трансляцию выше — или откройте эфир во встроенном браузере.');
+    renderLiveCandidates(items);
+    setLiveStatus('Выберите эфир чипом слева — или откройте эфир во встроенном браузере.');
   } catch (e) {
     setLiveStatus(e.message || String(e), 'err');
   } finally {
@@ -1043,15 +1039,13 @@ async function resolveAndRecord(url) {
   setLiveStatus('Ищу трансляцию…');
   try {
     const res = await window.api.live.resolve(url);
-    $('#liveCandidates').classList.add('hidden');
-    liveState.pickerItems = [];
+    clearLiveCandidates();
     if (!res || !res.ok) {
       renderLiveCard(res || { ok: false, error: 'Пустой ответ от main-процесса.' });
       return;
     }
     renderLiveCard(res);
-    // Нашли эфир — стартуем сразу, без второго нажатия: кнопка «Записать» в
-    // карточке остаётся как запасной вариант и для перезаписи другого эфира.
+    // Нашли эфир — стартуем сразу, без второго нажатия и без кнопки в карточке.
     return startLiveRecording(res.room);
   } catch (e) {
     setLiveStatus(e.message || String(e), 'err');
@@ -1063,14 +1057,14 @@ async function resolveAndRecord(url) {
 // that start slower, which widens the window rather than closing it.
 let liveStarting = false;
 
-function startLiveRecording(room, btn) {
+function startLiveRecording(room) {
   if (liveStarting) return;
   liveStarting = true;
-  if (btn) btn.disabled = true;
-  const withChat = Boolean($('#liveChatCheck') && $('#liveChatCheck').checked);
+const withChat = Boolean($('#liveChatCheck') && $('#liveChatCheck').checked);
+  const withAudio = Boolean($('#liveAudioCheck') && $('#liveAudioCheck').checked);
   const mode = $('#liveModeScreen') && $('#liveModeScreen').checked ? 'screen' : 'stream';
   Promise.resolve()
-    .then(() => window.api.live.start(room, { withChat, mode }))
+    .then(() => window.api.live.start(room, { withChat, withAudio, mode }))
     .then((r) => {
       if (!r || !r.ok) {
         return toast((r && r.error) || 'Не удалось начать запись.', 'err');
@@ -1087,98 +1081,115 @@ function startLiveRecording(room, btn) {
           'err'
         );
       }
+      // Sound in «Экран» comes from a separate process that may fail on its own
+      // (stream gone, room ended, no audio track). Warn now rather than let the
+      // user find a silent file afterwards.
+      if (mode === 'screen' && withAudio && r.withAudio === false) {
+        toast('Звук недоступен: эфир не отдаёт аудиопоток. Видео записывается без звука.', 'err');
+      }
       toast('Запись началась.', 'ok');
       autoOpenLiveDock();
     })
     .catch((e) => toast(e.message || String(e), 'err'))
     .finally(() => {
       liveStarting = false;
-      if (btn) btn.disabled = false;
     });
-}
-
-/**
- * Single source of truth for the «Идущие записи» panel state.
- *
- * Counts ROWS, not `liveState.jobs`: a finished capture is deliberately removed
- * from that map (it is no longer controllable) but its row stays on screen, so
- * counting the map would report "0 записей" while rows are plainly visible and
- * the «Очистить» button would have nothing to act on.
- */
-function syncLivePanel() {
-  const rows = $('#liveList').children.length;
-  $('#liveStopAllBtn').disabled = liveState.jobs.size === 0;
-  $('#liveClearBtn').disabled = rows === 0;
-  $('#liveCount').textContent = rows ? `· ${rows}` : '';
-  $('#liveEmpty').classList.toggle('hidden', rows > 0);
-  syncLiveDock();
 }
 
 function liveModeLabel(m) {
   return m === 'screen' ? 'экран' : 'поток';
 }
 
+/**
+ * Содержимое чипа записи: @ник · таймер · размер · fps (только «Экран»).
+ *
+ * Всё это раньше занимало отдельную строку в списке «Идущие записи» и
+ * распирало панель по высоте. Теперь строка ровно одна, поэтому чип обрезается
+ * по ширине стилями `.live-chip`, а всё, что в одну строку не влезло (режим,
+ * диагностика захвата экрана), уходит в его `title`.
+ */
+function paintLiveChip(job) {
+  if (!job || !job.textEl) return;
+  const parts = [liveTick(job.startedAt)];
+  if (job.downloaded) parts.push(fmtBytes(job.downloaded));
+  if (job.resolution) parts.push(job.resolution);
+  if (job.mode === 'screen' && Number.isFinite(job.frames)) parts.push(`кадров: ${job.frames}`);
+  // Реальная скорость захвата, а не номинальная: «Экран» упирается в то, как
+  // быстро capturePage отдаёт кадры, и именно это число отвечает на вопрос,
+  // будет запись похожа на видео или на слайд-шоу.
+  if (job.mode === 'screen' && Number.isFinite(job.fps)) parts.push(`${job.fps.toFixed(1)} кадр/с`);
+  if (job.chat) parts.push(`чата: ${job.chat}`);
+  const text = `${job.handle ? '@' + job.handle + ' · ' : ''}${parts.join(' · ')}`;
+  job.textEl.textContent = text;
+  if (job.chipEl) {
+    const head = `${liveModeLabel(job.mode)} · ${text}`;
+    // Жёлтая диагностика capturePage уходит в title чипа: раньше она была
+    // отдельной строкой и растягивала панель.
+    job.chipEl.title = job.note ? `${head}\n${job.note}` : head;
+  }
+}
+
 function addLiveJob(id, room, mode) {
   if (liveState.jobs.has(id)) return liveState.jobs.get(id);
-  const el = document.createElement('div');
-  el.className = 'job live-job';
-  el.innerHTML = `
-    <div class="job-top">
-      <div class="job-text">
-        <div class="job-title">${escapeHtml(room.title || `Эфир @${room.handle}`)}</div>
-        <div class="job-sub">@${escapeHtml(room.handle)} · ${liveModeLabel(mode)} · подключение…</div>
-      </div>
-      <span class="rec-badge">запись</span>
-      <button class="btn small">Остановить</button>
-    </div>
-  `;
-  const sub = el.querySelector('.job-sub');
-  const stopBtn = el.querySelector('button');
-  stopBtn.addEventListener('click', () => window.api.live.stop(id));
-  $('#liveList').prepend(el);
+  const box = $('#liveChips');
+
+  const chip = document.createElement('span');
+  chip.className = 'live-chip is-live';
+  const text = document.createElement('span');
+  text.className = 'live-chip-text';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn small';
+  btn.textContent = '✕';
+  btn.title = 'Остановить запись';
+  btn.addEventListener('click', () => window.api.live.stop(id));
+  chip.appendChild(text);
+  chip.appendChild(btn);
+  if (box) box.appendChild(chip);
 
   const job = {
     id,
-    element: el,
-    subEl: sub,
-    stopBtn,
+    chipEl: chip,
+    textEl: text,
+    btnEl: btn,
     startedAt: Date.now(),
     handle: room.handle,
     mode: mode === 'screen' ? 'screen' : 'stream',
-    // roomId links this row to the chat messages main routes to it.
+    // roomId links this chip to the chat messages main routes to it.
     roomId: room.roomId ? String(room.roomId) : '',
+    downloaded: 0,
+    resolution: '',
+    frames: null,
+    fps: null,
+    note: '',
     chat: 0,
   };
   liveState.jobs.set(id, job);
-  syncLivePanel();
+  paintLiveChip(job);
+  syncLiveDock();
   return job;
 }
 
 function dropLiveJob(id) {
   const job = liveState.jobs.get(id);
-  if (job) job.element.remove();
+  if (job && job.chipEl) job.chipEl.remove();
   liveState.jobs.delete(id);
-  syncLivePanel();
+  syncLiveDock();
 }
 
 /**
- * A finished capture stays in the list as a plain row with a «Показать» button,
- * exactly like a completed download in the queue. Auto-opening Explorer here
- * would pop a window for every recording that ends.
+ * Завершённая запись остаётся в строке как чип с рамкой «сохранено» и кнопкой
+ * «Показать», ровно как завершённая загрузка в очереди. Авто-открытие Проводника
+ * здесь было бы окном на каждую закончившуюся запись.
  */
 function finishLiveJob(r) {
   const job = liveState.jobs.get(r.id);
   if (!job) return;
   liveState.jobs.delete(r.id);
 
-  job.element.classList.add('ok');
-  job.element.classList.remove('live-job');
-  const badge = job.element.querySelector('.rec-badge');
-  if (badge) {
-    badge.textContent = 'сохранено';
-    badge.style.animation = 'none';
-    badge.style.background = 'var(--ok)';
-    badge.style.color = '#04220f';
+  if (job.chipEl) {
+    job.chipEl.classList.remove('is-live');
+    job.chipEl.classList.add('is-done');
   }
   // r.chat is normally the { count, ... } object from main finishChat();
   // never interpolate it directly — that prints "[object Object]".
@@ -1188,15 +1199,31 @@ function finishLiveJob(r) {
   } else if (typeof r.chat === 'number' && Number.isFinite(r.chat)) {
     chatPart = ` · чата: ${r.chat}`;
   }
-  job.subEl.textContent =
-    `@${r.handle || ''} · ${liveModeLabel(r.mode || job.mode)} · ${fmtDuration(r.elapsedSec)} записи · ${fmtBytes(r.size)}` +
+  const text =
+    `@${r.handle || job.handle || ''} · ${fmtDuration(r.elapsedSec)} · ${fmtBytes(r.size)}` +
     chatPart +
+    // Screen mode decides the sound question only at the very end, when the two
+    // ffmpeg runs are merged — so this is the first and only honest place to
+    // state it.
+    (r.mode === 'screen' ? (r.hasAudio ? ' · со звуком' : ' · без звука') : '') +
     (r.reason ? ` · ${r.reason.charAt(0).toLowerCase() + r.reason.slice(1)}` : '');
-  job.stopBtn.textContent = 'Показать';
-  job.stopBtn.disabled = false;
-  job.stopBtn.onclick = () => window.api.settings.reveal(r.path);
+  if (job.textEl) job.textEl.textContent = text;
+  if (job.chipEl) job.chipEl.title = `${liveModeLabel(r.mode || job.mode)} · ${text}`;
 
-  syncLivePanel();
+  // Кнопку пересоздаём, а не переиспользуем: у идущей записи на ней висит
+  // live.stop(id), и оставлять её рядом с «Показать» было бы вторым обработчиком.
+  if (job.btnEl) {
+    const revealBtn = document.createElement('button');
+    revealBtn.type = 'button';
+    revealBtn.className = 'btn small';
+    revealBtn.textContent = 'Показать';
+    revealBtn.title = r.path || 'Открыть папку с записью';
+    revealBtn.addEventListener('click', () => window.api.settings.reveal(r.path));
+    job.btnEl.replaceWith(revealBtn);
+    job.btnEl = revealBtn;
+  }
+
+  syncLiveDock();
   toast(`Запись сохранена: ${r.handle ? '@' + r.handle + ' · ' : ''}${fmtBytes(r.size)}`, 'ok');
 }
 
@@ -1207,49 +1234,50 @@ function finishLiveJob(r) {
 // including boot(), which blacks out the whole window. This project has been
 // bitten by exactly that shape of bug before, so the wiring is skipped instead.
 if (window.api && window.api.live) {
-  $('#liveRecBtn').addEventListener('click', () => {
-    recordCurrentLive().catch((e) => setLiveStatus(e.message || String(e), 'err'));
-  });
-  $('#liveToggleBtn').addEventListener('click', toggleLiveDock);
+  const recBtn = $('#liveRecBtn');
+  if (recBtn) {
+    recBtn.addEventListener('click', () => {
+      recordCurrentLive().catch((e) => setLiveStatus(e.message || String(e), 'err'));
+    });
+  }
+const clearBtn = $('#liveClearBtn');
+  if (clearBtn) clearBtn.addEventListener('click', clearLiveChips);
   syncLiveDock();
-  $('#liveStopAllBtn').addEventListener('click', async () => {
-    const n = liveState.jobs.size;
-    if (!n) return;
-    if (!confirm(`Остановить все записи (${n})? Файлы закроются и останутся на диске.`)) return;
-    await window.api.live.stopAll();
-    toast('Записи остановлены');
-  });
-  // «Очистить» empties the LIST ONLY: it drops the rows from #liveList. It never
-  // deletes anything on disk — finished captures stay in <downloadDir>\live\.
-  // The one side effect on the main process is stopping recordings that are
-  // still running, otherwise their rows would vanish while ffmpeg kept writing
-  // to a folder the user can no longer see or stop from the list.
-  $('#liveClearBtn').addEventListener('click', async () => {
-    const rows = Array.from($('#liveList').children);
-    if (!rows.length) return;
-    const active = liveState.jobs.size;
-    if (active > 0) {
-      const go = confirm(
-        `Активных записей: ${active}. Очистить список? ` +
-          'Они будут остановлены, файлы закроются и останутся на диске.'
-      );
-      if (!go) return;
-      await window.api.live.stopAll();
-    }
-    rows.forEach((el) => el.remove());
-    liveState.jobs.clear();
-    syncLivePanel();
-    toast(`Очищено: ${rows.length}`, 'ok');
-  });
 
-  // Mode hint under the radio row: plain words for what each mode records.
+  // Отдельной строки-подсказки больше нет: объяснение режима уезжает в title
+  // статус-строки, чтобы панель оставалась высотой ровно в одну строку.
+  // «Чат» и «звук» — это не самостоятельные переключатели, а часть выбранного
+  // режима, поэтому живут в одной функции вместе с подсказкой статуса.
+  //  - «Поток» пишется с CDN целиком: звук там уже есть по определению, а чат
+  //    всё равно снимается отдельным перехватом. Оба входа в этом режиме
+  //    бессмысленны — гасим их, чтобы не предлагать недоступное.
+  //  - «Экран» берёт звук из гостя через setDisplayMediaRequestHandler и пишет
+  //    его отдельной дорожкой, поэтому здесь оба входа осмысленны и включаются.
+  // Отметки при уходе в «Поток» НЕ сбрасываем: `.checked` у disabled-инпута
+  // читается из JS как обычно, иначе возврат к «Экрану» терял бы настройки.
+  // `.checked` также читается в startLiveRecording, поэтому синхронизация
+  // обязана завершиться до старта записи — она и вызывается оттуда же.
+  const syncLiveModeInputs = () => {
+    const isScreen = Boolean($('#liveModeScreen') && $('#liveModeScreen').checked);
+    const chat = $('#liveChatCheck');
+    const audio = $('#liveAudioCheck');
+    if (chat) {
+      chat.disabled = !isScreen;
+      if (isScreen) chat.checked = true;
+    }
+    if (audio) {
+      audio.disabled = !isScreen;
+      if (isScreen) audio.checked = true;
+    }
+  };
   const syncLiveModeHint = () => {
-    const el = $('#liveModeHint');
+    const el = $('#liveStatus');
     if (!el) return;
-    el.textContent =
+    el.title =
       $('#liveModeScreen') && $('#liveModeScreen').checked
-        ? 'Записывается окно страницы: видео, зрители и чат — как на экране. Не переключайтесь на другие вкладки и не сворачивайте окно.'
-        : 'Поток: пишется чистое видео эфира с CDN. Качество максимальное. Можно переключаться на другие вкладки.';
+        ? 'Экран: записывается окно страницы — видео, зрители и чат. Не сворачивайте окно и не переключайте вкладки. Скорость зависит от нагрузки, обычно 5–15 кадров в секунду. Звук пишется отдельно и приклеивается в конце.'
+        : 'Поток: пишется чистое видео эфира с CDN вместе со звуком. Качество максимальное. Можно переключаться на другие вкладки.';
+    syncLiveModeInputs();
   };
   if ($('#liveModeStream')) $('#liveModeStream').addEventListener('change', syncLiveModeHint);
   if ($('#liveModeScreen')) $('#liveModeScreen').addEventListener('change', syncLiveModeHint);
@@ -1258,13 +1286,19 @@ if (window.api && window.api.live) {
   window.api.live.onProgress((p) => {
     const job = liveState.jobs.get(p.id);
     if (!job) return;
-    const parts = [liveTick(job.startedAt), liveModeLabel(job.mode)];
-    if (p.downloaded) parts.push(fmtBytes(p.downloaded));
-    if (p.resolution) parts.push(p.resolution);
-    if (p.mode === 'screen' && Number.isFinite(p.frames)) parts.push(`кадров: ${p.frames}`);
-    if (job.chat) parts.push(`чата: ${job.chat}`);
-    job.subEl.textContent = `${p.handle ? '@' + p.handle + ' · ' : ''}${parts.join(' · ')}`;
-    // The per-row stop button is deliberately left ENABLED here. Disabling it on
+    if (p.handle) job.handle = p.handle;
+    if (p.downloaded) job.downloaded = p.downloaded;
+    if (p.resolution) job.resolution = p.resolution;
+    if (Number.isFinite(p.frames)) job.frames = p.frames;
+    if (Number.isFinite(p.fps)) job.fps = p.fps;
+    // `note` is the tail of the main process's screen-capture journal. It exists
+    // because screen mode failed three rounds of static analysis: the chip alone
+    // ("подключение…") cannot say whether capturePage hangs, returns blanks, or
+    // ffmpeg refuses the audio input. It goes into the chip's title — a fact the
+    // user can screenshot, without growing the panel by a line.
+    if (p.mode === 'screen' && p.note) job.note = p.note;
+    paintLiveChip(job);
+    // The per-chip stop button is deliberately left ENABLED here. Disabling it on
     // progress made it permanently dead: nothing re-enabled it until the job
     // finished, so per-recording stop was impossible. live.stop() is idempotent,
     // so a double click is harmless.
@@ -1277,6 +1311,7 @@ if (window.api && window.api.live) {
     for (const job of liveState.jobs.values()) {
       if (roomId && job.roomId && job.roomId !== roomId) continue;
       job.chat = count;
+      paintLiveChip(job);
     }
   });
 
@@ -1285,8 +1320,8 @@ if (window.api && window.api.live) {
   });
 
   window.api.live.onError(({ id, message }) => {
-    // A job the user already removed via «Очистить» is gone from the map; its
-    // late error must not pop a toast about a recording that is off the screen.
+    // A recording the user no longer sees is gone from the map; its late error
+    // must not pop a toast about something that is off the screen.
     if (!liveState.jobs.has(id)) return;
     dropLiveJob(id);
     toast(message || 'Запись прервана', 'err');
@@ -1295,6 +1330,27 @@ if (window.api && window.api.live) {
   const box = $('#liveStatus');
   if (box) box.textContent = 'Запись эфиров недоступна: перезапустите приложение.';
 }
+
+// «Обновить страницу» — перезагрузка встроенного браузера на месте. Раньше
+// непрогрузившуюся ленту можно было вылечить только перезапуском приложения.
+// `reload()` на <webview> сохраняет текущий URL, поэтому открытый эфир или ролик
+// остаются там же; если гостя ещё нет, он просто создаётся. Кнопка работает с
+// любой вкладки: перезагружать скрытый webview не мешает, а ждать перехода на
+// «Обзор» не нужно.
+$('#reloadWebBtn').addEventListener('click', () => {
+  const wv = state.webview;
+  if (!wv) {
+    mountWebview();
+    toast('Страница загружается', 'ok');
+    return;
+  }
+  try {
+    wv.reload();
+    toast('Страница обновляется', 'ok');
+  } catch (e) {
+    toast('Не удалось обновить страницу: ' + (e && (e.message || e)), 'err');
+  }
+});
 
 function switchTab(name) {
   $$('.tab').forEach((t) => t.classList.toggle('active', t.dataset.view === name));

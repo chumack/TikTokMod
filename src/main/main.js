@@ -40,6 +40,10 @@ let liveJobSeq = 0;
 // container, but app.quit() does not wait for it. Set while that drain runs so
 // before-quit can defer the real exit exactly once.
 let quittingAfterDrain = false;
+// Screen recordings being STARTED right now. startScreen() registers itself in
+// live's `running` map only after its first capturePage(), so live.list() cannot
+// see it during that window and two fast clicks could both pass the cap check.
+let liveScreenStarting = 0;
 
 function createWindow() {
   win = new BrowserWindow({
@@ -62,6 +66,13 @@ function createWindow() {
 
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
   win.webContents.setMaxListeners(20);
+
+  // The hidden audio-capture window must never outlive the main one: it is a
+  // BrowserWindow like any other, so leaving it open would stop `window-all-closed`
+  // from ever firing and the app would survive with nothing on screen.
+  win.on('closed', () => {
+    destroyGuestAudioWindow();
+  });
 
   win.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:/i.test(url)) shell.openExternal(url);
@@ -641,6 +652,11 @@ app.whenReady().then(async () => {
   ensureEmulatorPersisted();
   Menu.setApplicationMenu(buildMenu());
   createWindow();
+  // Screen mode takes its sound from the guest's own audio track (see the
+  // guest-audio block above). Registered once, here, because the handler has to
+  // be in place before any getDisplayMedia request can arrive — the capture window
+  // is created later, on the first recording that asks for sound.
+  installGuestAudioCapture();
 
   if (process.argv.includes('--selftest')) runSelfTest();
 
@@ -958,8 +974,13 @@ app.on('window-all-closed', () => {
   ytdlp.cancelAll();
   stopAllDomPolls();
   live.stopAll('Приложение закрыто.');
-  // Chat sinks only live as long as their recording; closing them here flushes
-  // the last subtitle cue so the .srt is not missing its tail on a forced exit.
+  // Flush and close the guest capture, then drop its window. This is the one path
+  // that can run with no renderer left to answer a stop request, and the file
+  // handle MUST be released here or the process never exits.
+  stopGuestAudioCapture();
+  destroyGuestAudioWindow();
+  // Chat sinks only live as long as their recording; closing them here flushes the
+  // last subtitle cue so the .srt is not missing its tail on a forced exit.
   livechat.closeAll();
   if (process.platform !== 'darwin') app.quit();
 });
@@ -967,6 +988,9 @@ app.on('window-all-closed', () => {
 app.on('before-quit', (e) => {
   ytdlp.cancelAll();
   stopAllDomPolls();
+  // The recorder holds an open file handle and a live getDisplayMedia stream;
+  // both have to be gone before the process can reach exit(0).
+  stopGuestAudioCapture();
 
   const n = live.status().running;
   if (!n) return;
@@ -1197,10 +1221,23 @@ function attachGuestMenu(id) {
   // unaffected.
   wc.on('dom-ready', () => {
     feed.installHooks();
+    installChatTap(wc);
+  });
+
+  // A live room opens its webcast socket as the route change commits, so the tap
+  // has to be back in place on every SPA navigation — not just on a full load,
+  // where dom-ready already covers it. installChatTap is idempotent (the tap is
+  // too), so the overlap is free.
+  wc.on('did-navigate-in-page', (_e, url) => {
+    installChatTap(wc, url);
+  });
+  wc.on('did-stop-loading', () => {
+    installChatTap(wc);
   });
 
   wc.on('destroyed', () => {
     guestMenuWired.delete(wc.id);
+    chatTaps.delete(wc.id);
   });
   return true;
 }
@@ -1285,6 +1322,522 @@ ipcMain.handle('live:detect', async () => {
   }
 });
 
+// ============================================================================
+// Screen mode: taking the sound from the BROWSER instead of the CDN.
+//
+// THE PROBLEM THIS REPLACES. Screen mode ("Экран") records page PIXELS with
+// guest.capturePage(), and the pixels are what the player is showing — i.e.
+// content that already went through Chromium's playback buffers and is therefore
+// 2-5 s behind the live edge. The sound used to come from a SECOND, independent
+// ffmpeg pointed at the signed CDN URL, which reads the live edge directly. Two
+// signals, two different points of the pipeline, and nothing in between to measure
+// the gap: three attempts to correct it with a constant `-itsoffset` all failed
+// (see screenMuxArgs), and the player's buffer depth is not exposed through any
+// API the guest page can be asked about.
+//
+// THE FIX. Take the sound out of the SAME Chromium that plays the picture, after
+// the same buffers — Electron can hand out the audio of one webContents'
+// WebFrameMain to another through a display-media request handler. Both signals
+// then share one clock by construction, and the only thing left to align is the
+// difference between two Date.now() stamps taken in the main process.
+//
+// EVERYTHING HERE IS OPTIONAL. It runs next to a recording that is already
+// capturing frames; a failure anywhere below must leave "recording, no sound"
+// behind and never touch the video.
+// ============================================================================
+
+// Absolute path of the page that does the capture. The file itself is an empty
+// shell — the logic is injected, see GUEST_AUDIO_SOURCE.
+const GUEST_AUDIO_PAGE = path.join(__dirname, '..', 'renderer', 'audio-capture.html');
+const GUEST_AUDIO_PRELOAD = path.join(__dirname, '..', 'preload', 'audio-capture-preload.js');
+
+// The capture in flight, or null. `{ fd, startedAt, stopTimer, path }` plus the
+// bookkeeping below. Exactly one at a time: only one screen recording may run
+// (see live:start), and a second capture would fight over the same file.
+let guestAudioJob = null;
+// The hidden window, created lazily on the first capture and destroyed right
+// after the last one. It must never be left open: `window-all-closed` only fires
+// when EVERY BrowserWindow is gone, so a lingering hidden window would keep the
+// app alive after the user closes the main one.
+let guestAudioWindow = null;
+// Resolves once guestAudioWindow's page is loaded and can run injected source.
+let guestAudioWindowReady = null;
+
+/**
+ * The recording logic, shipped to the capture page as SOURCE TEXT.
+ *
+ * It must run in the MAIN world: navigator.mediaDevices, getDisplayMedia and
+ * MediaRecorder do not exist in the isolated world, and webContents
+ * .executeJavaScript() is the only call here that reaches it. That also means it
+ * is not subject to the page CSP, which is why audio-capture.html can forbid
+ * script sources entirely.
+ *
+ * Everything is self-contained — no name from this module may be referenced — and
+ * every failure is turned into `{ ok:false, error }` rather than a rejection,
+ * because a rejected promise here is only visible as a silently silent recording.
+ */
+const GUEST_AUDIO_SOURCE = `(() => {
+  const S = (window.__tkmGA = window.__tkmGA || { rec: null, stream: null, startedAt: 0 });
+  const bridge = window.guestAudio || null;
+  const say = (fn, v) => { try { if (bridge && typeof bridge[fn] === 'function') bridge[fn](v); } catch (_) {} };
+  const bail = (m) => { say('fail', m); return { ok: false, error: String(m) }; };
+
+  // Opus in WebM is what ffmpeg demuxes natively from the sidecar; anything else
+  // (pcm, mp4) would need a bitstream filter or a re-wrap for no gain.
+  const pickMime = () => {
+    for (const m of ['audio/webm;codecs=opus', 'audio/webm']) {
+      try { if (window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m; } catch (_) {}
+    }
+    return '';
+  };
+
+  // Byte-wise base64 without blowing the argument limit on a large chunk.
+  const toB64 = (buf) => {
+    const u8 = new Uint8Array(buf);
+    let s = '';
+    for (let i = 0; i < u8.length; i += 4096) {
+      s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + 4096, u8.length)));
+    }
+    return btoa(s);
+  };
+
+  window.__tkmGuestAudioStart = async function () {
+    if (S.rec && S.rec.state !== 'inactive') return { ok: true, startedAt: S.startedAt };
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+        return bail('в окне захвата недоступен getDisplayMedia');
+      }
+      // No user gesture and no picker: Electron's setDisplayMediaRequestHandler
+      // answers this itself (see installGuestAudioCapture). Video is NOT
+      // requested — only the guest's audio track is of any use here.
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: false, audio: true });
+      const tracks = (stream.getAudioTracks ? stream.getAudioTracks() : []).filter((t) => t.kind === 'audio');
+      if (!tracks.length) {
+        try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+        return bail('захват вернулся без аудио-дорожки — плеер эфира молчит');
+      }
+      const mime = pickMime();
+      const rec = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
+      S.stream = stream;
+      S.rec = rec;
+      rec.ondataavailable = (e) => {
+        const d = e && e.data;
+        if (!d || !d.size) return;
+        try { d.arrayBuffer().then((b) => say('chunk', toB64(b))).catch(() => {}); } catch (_) {}
+      };
+      rec.onstop = () => say('done', { startedAt: S.startedAt, stoppedAt: Date.now() });
+      rec.onerror = (e) => say('fail', 'MediaRecorder: ' + ((e && e.error && e.error.name) || 'error'));
+      rec.start(200);
+      // The one number the whole design rests on: the wall clock at the instant
+      // recording actually began, taken HERE and not in main, because everything
+      // before this line is negotiation and everything after it is content.
+      S.startedAt = Date.now();
+      say('ready', { startedAt: S.startedAt, mime: rec.mimeType || mime || '' });
+      return { ok: true, startedAt: S.startedAt };
+    } catch (e) {
+      return bail((e && ((e.name || '') + ': ' + (e.message || ''))) || String(e));
+    }
+  };
+
+  window.__tkmGuestAudioStop = function () {
+    // requestData() first: it forces the buffered tail out as one final chunk, so
+    // the last few hundred milliseconds of sound are not thrown away by stop().
+    const rec = S.rec;
+    if (rec && rec.state !== 'inactive') {
+      try { rec.requestData(); } catch (_) {}
+      try { rec.stop(); } catch (_) {}
+    }
+    if (S.stream) {
+      // Stopping the track is what actually ends the source; without it Chromium
+      // keeps the capture alive and the renderer process never goes idle.
+      try { S.stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+      S.stream = null;
+    }
+    return { ok: true, startedAt: S.startedAt };
+  };
+
+  return true;
+})()`;
+
+/** Promise race against a wall-clock cap. Never rejects, never leaks a timer. */
+function withTimeout(promise, ms, fallback) {
+  let timer = null;
+  const guard = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(fallback), ms);
+    if (timer.unref) timer.unref();
+  });
+  return Promise.race([Promise.resolve(promise).then((v) => v, () => fallback), guard]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+/**
+ * Answers the capture window's getDisplayMedia with the GUEST's audio track.
+ *
+ * `{ audio: <WebFrameMain>, enableLocalEcho: true }` is the whole point: the audio
+ * handed over is what that frame is actually playing, i.e. post-buffer, post-
+ * player-delay — the same signal the screen capture is filming.
+ *
+ * `enableLocalEcho: true` means "do not mute the source while capturing it", so the
+ * user keeps hearing the room. It does NOT mean the captured stream is played
+ * back anywhere: nothing in the capture page ever attaches it to an <audio> or
+ * <video> element, so there is no second copy of the sound to echo. With the flag
+ * left at its default the guest would go SILENT in the speakers for the whole
+ * recording, which is the far worse outcome.
+ *
+ * Deliberately NOT `loopback`: capturing the system mix is exactly the thing this
+ * change removes, and it would drag every other sound the machine makes into the
+ * recording. If the guest is gone there is nothing correct to substitute, so the
+ * request is denied and the caller falls back to the CDN track.
+ */
+function installGuestAudioCapture() {
+  try {
+    session.defaultSession.setDisplayMediaRequestHandler(
+      (request, callback) => {
+        try {
+          // Only the hidden capture window may ask. Without this check any page in
+          // the app could pull the live room's audio out of the guest.
+          // routingId is only unique per renderer process, so both ids are compared.
+          if (
+            request &&
+            request.frame &&
+            guestAudioWindow &&
+            !guestAudioWindow.isDestroyed() &&
+            (request.frame.routingId !== guestAudioWindow.webContents.mainFrame.routingId ||
+              request.frame.processId !== guestAudioWindow.webContents.mainFrame.processId)
+          ) {
+            callback({});
+            return;
+          }
+          const guest = feedGuestId ? webContents.fromId(Number(feedGuestId)) : null;
+          if (!guest || guest.isDestroyed()) {
+            console.warn('[guestAudio] запрос захвата без гостя — звук гостя недоступен');
+            callback({});
+            return;
+          }
+          callback({ audio: guest.mainFrame, enableLocalEcho: true });
+        } catch (e) {
+          console.warn('[guestAudio] обработчик захвата упал:', e && (e.message || e));
+          try {
+            callback({});
+          } catch (_) {}
+        }
+      },
+      { useSystemPicker: false }
+    );
+  } catch (e) {
+    console.warn('[guestAudio] setDisplayMediaRequestHandler недоступен:', e && (e.message || e));
+  }
+}
+
+/**
+ * The hidden window the capture runs in. Never shown, never focused, never in the
+ * taskbar — it exists so that getDisplayMedia has a document to live in.
+ *
+ * Created on demand rather than at startup: an always-open hidden window would keep
+ * the app from quitting (see guestAudioWindow) and would pay a renderer process for
+ * recordings that never ask for sound.
+ */
+function ensureGuestAudioWindow() {
+  if (guestAudioWindow && !guestAudioWindow.isDestroyed()) return guestAudioWindowReady;
+  try {
+    guestAudioWindow = new BrowserWindow({
+      show: false,
+      width: 320,
+      height: 240,
+      skipTaskbar: true,
+      backgroundColor: '#000000',
+      webPreferences: {
+        preload: GUEST_AUDIO_PRELOAD,
+        contextIsolation: true,
+        nodeIntegration: false,
+        // The capture must keep ticking while the app window is in the background,
+        // which is exactly what Chromium would otherwise throttle away.
+        backgroundThrottling: false,
+      },
+    });
+  } catch (e) {
+    console.warn('[guestAudio] окно захвата не создалось:', e && (e.message || e));
+    guestAudioWindow = null;
+    guestAudioWindowReady = Promise.resolve(null);
+    return guestAudioWindowReady;
+  }
+
+  // A window created with show:false is never shown, but it still has to be torn
+  // down by hand or `window-all-closed` will not fire when the user closes the
+  // app window.
+  guestAudioWindow.on('closed', () => {
+    if (guestAudioWindow && guestAudioWindow.isDestroyed()) guestAudioWindow = null;
+  });
+
+  guestAudioWindowReady = new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
+    const timer = setTimeout(() => done(null), 5000);
+    if (timer.unref) timer.unref();
+    guestAudioWindow.webContents.once('did-finish-load', () => {
+      clearTimeout(timer);
+      done(guestAudioWindow && !guestAudioWindow.isDestroyed() ? guestAudioWindow.webContents : null);
+    });
+    try {
+      guestAudioWindow.loadFile(GUEST_AUDIO_PAGE);
+    } catch (_) {
+      clearTimeout(timer);
+      done(null);
+    }
+  });
+  return guestAudioWindowReady;
+}
+
+/** Drops the capture window. Safe to call at any time, including twice. */
+function destroyGuestAudioWindow() {
+  const w = guestAudioWindow;
+  guestAudioWindow = null;
+  guestAudioWindowReady = null;
+  if (!w || w.isDestroyed()) return;
+  try {
+    w.destroy();
+  } catch (_) {}
+}
+
+/**
+ * Appends one Opus chunk from the capture page to the sidecar, and remembers when
+ * the first real byte landed. The file is opened once with 'a' and written with
+ * writeSync: chunks arrive every 200 ms and a stream would only add buffering
+ * between the recorder and the disk for no benefit.
+ */
+ipcMain.on('guestAudio:chunks', (e, b64) => {
+  const job = guestAudioJob;
+  if (!job || job.fd === null) return;
+  if (!job.wc || e.sender !== job.wc) return;
+  let buf;
+  try {
+    buf = Buffer.from(typeof b64 === 'string' ? b64 : '', 'base64');
+  } catch (_) {
+    return;
+  }
+  if (!buf.length) return;
+  try {
+    fs.writeSync(job.fd, buf, 0, buf.length);
+    job.bytes += buf.length;
+    if (!job.firstBytes) {
+      job.firstBytes = true;
+      try {
+        job.resolveFirst(true);
+      } catch (_) {}
+    }
+  } catch (err) {
+    console.warn('[guestAudio] запись чанка не удалась:', err && (err.message || err));
+  }
+});
+
+ipcMain.on('guestAudio:ready', (e, info) => {
+  const job = guestAudioJob;
+  if (!job || !job.wc || e.sender !== job.wc) return;
+  const at = Number(info && info.startedAt);
+  if (Number.isFinite(at) && at > 0) job.startedAt = at;
+});
+
+ipcMain.on('guestAudio:done', (e, info) => {
+  const job = guestAudioJob;
+  if (!job || !job.wc || e.sender !== job.wc) return;
+  const at = Number(info && info.startedAt);
+  if (!job.startedAt && Number.isFinite(at) && at > 0) job.startedAt = at;
+  job.stoppedAt = Number(info && info.stoppedAt) || Date.now();
+  try {
+    job.resolveDone(true);
+  } catch (_) {}
+});
+
+ipcMain.on('guestAudio:fail', (e, message) => {
+  const job = guestAudioJob;
+  if (!job || !job.wc || e.sender !== job.wc) return;
+  job.error = String(message || 'захват звука не удался');
+  try {
+    job.resolveDone(false);
+  } catch (_) {}
+});
+
+// Control surface. main drives these directly from live:start; they are registered
+// as handlers so the two channels exist on both sides of the bridge and cannot
+// drift apart.
+ipcMain.handle('guestAudio:start', (_e, payload) => startGuestAudioCapture(payload || {}));
+ipcMain.handle('guestAudio:stop', () => stopGuestAudioCapture());
+
+/**
+ * Starts the guest capture into <video base>.guest.webm.
+ *
+ * Returns `{ ok:true, startedAt }` or `{ ok:false, error }` with plain Russian
+ * text — the caller shows it and continues recording regardless. Nothing here
+ * throws: a capture failure is a missing soundtrack, not a failed recording.
+ */
+async function startGuestAudioCapture({ path: file, videoStartedAt } = {}) {
+  // Whatever was running must be finished and closed before a new file is opened.
+  await stopGuestAudioCapture();
+
+  const target = typeof file === 'string' && file ? file : '';
+  // Allowlist, because this function opens a file for APPENDING and the handler
+  // below is reachable over IPC: the only path it will ever touch is
+  // <downloadDir>/live/<base>.guest.webm, the name live.js generated.
+  const liveDir = path.resolve(settings.get().downloadDir || '.', 'live');
+  if (
+    !path.isAbsolute(target) ||
+    path.resolve(path.dirname(target)) !== liveDir ||
+    !/\.guest\.webm$/i.test(target)
+  ) {
+    return { ok: false, error: 'недопустимый путь для файла звука' };
+  }
+  try {
+    fs.mkdirSync(liveDir, { recursive: true });
+  } catch (_) {}
+  // A stale sidecar from an earlier attempt would be muxed in as if it were this
+  // recording's audio.
+  try {
+    if (fs.existsSync(target)) fs.unlinkSync(target);
+  } catch (_) {}
+
+  const wc = await ensureGuestAudioWindow();
+  if (!wc) {
+    destroyGuestAudioWindow();
+    return { ok: false, error: 'окно захвата звука не открылось' };
+  }
+
+  let fd;
+  try {
+    fd = fs.openSync(target, 'a');
+  } catch (e) {
+    destroyGuestAudioWindow();
+    return { ok: false, error: `не удалось создать файл звука: ${e.message || e}` };
+  }
+
+  // The resolvers are attached to the job AFTER the literal is built. Writing them
+  // as properties of that same literal captures the initial no-ops — property
+  // values are read in source order, and the Promise constructors that replace the
+  // no-ops come later in the object — so the "first bytes" wait below could never
+  // be released early and always burned its full timeout.
+  let resolveFirst = () => {};
+  let resolveDone = () => {};
+  const firstBytesPromise = new Promise((r) => {
+    resolveFirst = r;
+  });
+  const donePromise = new Promise((r) => {
+    resolveDone = r;
+  });
+  const job = {
+    fd,
+    path: target,
+    // The absolute wall clock at which MediaRecorder actually began, reported by
+    // the page. `videoStartedAt` is the counterpart the shift is computed from.
+    startedAt: 0,
+    videoStartedAt: Number(videoStartedAt) || 0,
+    // Armed when a stop is requested; see stopGuestAudioCapture.
+    stopTimer: null,
+    bytes: 0,
+    firstBytes: false,
+    error: null,
+    wc,
+    resolveFirst,
+    resolveDone,
+    firstBytesPromise,
+    donePromise,
+  };
+  guestAudioJob = job;
+
+  let started = null;
+  try {
+    started = await withTimeout(wc.executeJavaScript(GUEST_AUDIO_SOURCE + '\n;__tkmGuestAudioStart();', true), 8000, null);
+  } catch (_) {
+    started = null;
+  }
+
+  // The recording may have been stopped while this function was still waiting on
+  // the page. The capture is already gone in that case; saying so beats reporting a
+  // success for a stream nobody is holding.
+  if (guestAudioJob !== job) {
+    return { ok: false, error: 'захват остановлен, пока запускался' };
+  }
+  if (!started || started.ok !== true) {
+    const error = (started && started.error) || job.error || 'страница захвата не ответила';
+    await stopGuestAudioCapture();
+    return { ok: false, error };
+  }
+  if (!job.startedAt) job.startedAt = Number(started.startedAt) || Date.now();
+
+  // Give the recorder a moment to produce real output. Silence is not a failure —
+  // a room with nothing playing legitimately writes nothing — so the bytes are
+  // waited for but NOT required; finalize() decides on the file that results.
+  await withTimeout(firstBytesPromise, 5000, false);
+
+  return { ok: true, startedAt: job.startedAt, path: target, bytes: job.bytes };
+}
+
+/**
+ * Flushes and closes the capture. Idempotent, always closes the fd, and never
+ * rejects: it is called from stop(), from quit paths and from the start of the
+ * next capture.
+ */
+function stopGuestAudioCapture() {
+  const job = guestAudioJob;
+  if (!job) return Promise.resolve({ ok: true, stopped: false });
+  if (job.stopPromise) return job.stopPromise;
+
+  job.stopped = true;
+  job.stopPromise = (async () => {
+    const wc = job.wc;
+    // Armed HERE, not at start: the watchdog exists for a page that does not answer
+    // the stop, so arming it while the capture is healthy would only ever fire
+    // during a recording the user still wants. Destroying the window drops the
+    // getDisplayMedia track and kills the renderer; the fd is closed below on every
+    // path regardless, so nothing can outlive the function.
+    job.stopTimer = setTimeout(() => {
+      if (guestAudioJob === job) {
+        console.warn('[guestAudio] страница не ответила на остановку — окно уничтожено');
+        destroyGuestAudioWindow();
+      }
+    }, 4000);
+    if (job.stopTimer.unref) job.stopTimer.unref();
+    try {
+      if (wc && !wc.isDestroyed()) {
+        await withTimeout(
+          wc.executeJavaScript('(window.__tkmGuestAudioStop ? window.__tkmGuestAudioStop() : null)', true),
+          2000,
+          null
+        );
+      }
+    } catch (_) {}
+    // Wait for MediaRecorder's `stop` so the final ondataavailable chunk is written
+    // BEFORE the fd is closed. Capped: a wedged recorder must not hold the file.
+    await withTimeout(job.donePromise, 2500, false);
+    try {
+      if (job.fd !== null) {
+        fs.closeSync(job.fd);
+      }
+    } catch (_) {}
+    job.fd = null;
+    if (job.stopTimer) {
+      clearTimeout(job.stopTimer);
+      job.stopTimer = null;
+    }
+    destroyGuestAudioWindow();
+    const result = { ok: true, path: job.path, startedAt: job.startedAt, bytes: job.bytes, error: job.error };
+    if (guestAudioJob === job) guestAudioJob = null;
+    return result;
+  })()
+    // Several callers fire this without awaiting (stop, quit, the reap backstop in
+    // live). An escaping rejection there would be an unhandledRejection in the main
+    // process, which Electron surfaces as a modal "A JavaScript error occurred" over
+    // the user's recording — so it cannot be allowed to escape.
+    .catch((e) => {
+      console.warn('[guestAudio] остановка упала:', e && (e.message || e));
+      return { ok: false, path: job.path, startedAt: job.startedAt, bytes: job.bytes, error: job.error };
+    });
+  return job.stopPromise;
+}
+
 // Start a recording.
 //
 // The room the renderer holds was resolved when the user pressed «Запись
@@ -1302,6 +1855,11 @@ ipcMain.handle('live:start', async (_e, room, opts = {}) => {
   }
   const s = settings.get();
   const withChat = opts && opts.withChat === true;
+  // Sound defaults to ON. A screen recording with no sound is rarely what
+  // anyone wants, and because the audio lives in its own process its failure can
+  // only ever downgrade the result to silence — never fail the recording. Stream
+  // mode ignores this entirely: the CDN stream carries its own audio.
+  const withAudio = !opts || opts.withAudio !== false;
   // 'stream' (default) records the clean CDN stream; 'screen' records the page
   // pixels via guest capturePage(), with the CDN stream as audio-only.
   const mode = opts && opts.mode === 'screen' ? 'screen' : 'stream';
@@ -1311,19 +1869,26 @@ ipcMain.handle('live:start', async (_e, room, opts = {}) => {
   if (live.status().running >= 3) {
     return { ok: false, error: 'Уже идёт 3 записи. Остановите одну из них перед началом новой.' };
   }
-  // Screen captures are CPU-heavy (capturePage JPEGs + x264 on every tick):
+  // Screen captures are CPU-heavy (capturePage + x264 on every tick):
   // at most one at a time, independent of the stream cap.
+  //
+  // The counter alone is not enough any more. startScreen() is async and takes its
+  // first capturePage() — which can take seconds — BEFORE it registers itself in
+  // live's `running` map, so two fast clicks both used to sail past this check and
+  // start two screen recordings. The in-flight counter covers that window; it is
+  // released in a finally below whatever the outcome.
   if (mode === 'screen' && live.list().some((j) => j && j.mode === 'screen')) {
     return { ok: false, error: 'Экранная запись уже идёт. Остановите её перед началом новой.' };
   }
 
-  let fresh;
+  let resolved = null;
+  let fresh = null;
   try {
     fresh = await live.resolve(room.pageUrl || `@${room.handle}`, s);
   } catch (e) {
     return { ok: false, error: e.message || String(e) };
   }
-  let resolved = fresh && fresh.ok ? fresh.room : null;
+  resolved = fresh && fresh.ok ? fresh.room : null;
   if (!resolved) {
     const resolveError = (fresh && fresh.error) || 'Не удалось обновить данные эфира.';
     if (mode !== 'screen') {
@@ -1359,6 +1924,7 @@ ipcMain.handle('live:start', async (_e, room, opts = {}) => {
   let chatPoll = null;
   const finishChat = () => {
     chatPoll = clearDomTimer(chatPoll);
+    stopChatTapStats();
     if (!chat) return null;
     const roomId = chat.roomId;
     const res = livechat.close(roomId);
@@ -1375,7 +1941,11 @@ ipcMain.handle('live:start', async (_e, room, opts = {}) => {
   if (mode === 'screen') {
     const candidates = Array.isArray(resolved.streams) ? resolved.streams : [];
     const https = candidates.filter((x) => x && typeof x.url === 'string' && /^https?:\/\//i.test(x.url));
-    screenAudioUrl = https.length ? https[0].url : null;
+    // FLV first, HLS only as a fallback. The audio process is a plain
+    // `ffmpeg -i <url> -vn -c:a aac -f adts`, and an FLV feed needs no demuxer
+    // gymnastics; HLS would also drag a segment playlist into a process that is
+    // supposed to be as dumb and as unbreakable as possible.
+    screenAudioUrl = (https.find((x) => x.kind === 'flv') || https[0] || {}).url || null;
     try {
       const wc = webContents.fromId(Number(feedGuestId));
       screenGuest = wc && !wc.isDestroyed() ? wc : null;
@@ -1388,6 +1958,14 @@ ipcMain.handle('live:start', async (_e, room, opts = {}) => {
   }
 
   let started;
+  // The in-flight guard for the exact vulnerable window. startScreen() is async
+  // and takes its first capturePage() — which can take seconds — BEFORE it
+  // registers itself in live's `running` map, so `live.list()` above cannot see it
+  // yet and two fast clicks both used to start two screen recordings. The flag is
+  // taken here, immediately before the call, and released in the finally below, so
+  // every early return above leaves no state behind.
+  const screenSlot = mode === 'screen';
+  if (screenSlot) liveScreenStarting += 1;
   try {
     const liveCallbacks = {
       onProgress: (p) => {
@@ -1404,19 +1982,88 @@ ipcMain.handle('live:start', async (_e, room, opts = {}) => {
     };
     started =
       mode === 'screen'
-        ? live.startScreen(jobId, resolved, s, {
+        ? await live.startScreen(jobId, resolved, s, {
             guest: screenGuest,
-            audioUrl: screenAudioUrl,
-            fps: 10,
+            // Sound for screen mode comes from a SECOND, independent ffmpeg
+            // that demuxes audio only, and is merged into the finished video
+            // afterwards. It deliberately is not a second input of the video
+            // process: measured on a live room, that made ffmpeg block forever
+            // in the probe of the signed CDN URL — 197 frames captured, zero
+            // written, file stuck at the 36-byte container header. Splitting the
+            // processes means a dead or 403ing audio stream can no longer take
+            // the video down with it; the worst case is a silent recording.
+            // Stream mode ("Поток") is unaffected: there the CDN URL is the only
+            // input and sound comes along for free.
+            audioUrl: withAudio ? screenAudioUrl : null,
+            // Not a target but a ceiling: the real rate is whatever the compositor
+            // produces, capped at the frame interval (1/fps). See screenFfmpegArgs.
+            fps: 25,
             quality: 70,
+            // The dock's manual A/V correction, in seconds. It is applied when the
+            // recording is muxed, so the user can change it while recording runs.
+            avShift: Number(opts && opts.avShift) || 0,
             ...liveCallbacks,
           })
         : live.start(jobId, resolved, s, liveCallbacks);
   } catch (e) {
     return { ok: false, error: `Не удалось запустить запись: ${e.message || e}` };
+  } finally {
+    if (screenSlot) liveScreenStarting = Math.max(0, liveScreenStarting - 1);
   }
   if (!started || started.error) {
     return { ok: false, error: (started && started.error) || 'Не удалось запустить запись.' };
+  }
+
+  // ---- screen mode: the sound comes out of the browser, after the player's ----
+  // ---- own buffers, so it is in sync with the picture by construction. -------
+  //
+  // Started AFTER startScreen(), i.e. after the video ffmpeg is already running
+  // and taking frames: the recording must never wait on the capture. The video's
+  // own start stamp is handed over here and comes back with the audio's, and the
+  // difference of the two is the only shift the final mux applies (see
+  // screenGuestMuxArgs in live.js).
+  let guestAudioOk = false;
+  if (mode === 'screen' && withAudio && started.guestAudioPath) {
+    try {
+      const res = await startGuestAudioCapture({
+        path: started.guestAudioPath,
+        videoStartedAt: started.startedAt,
+      });
+      guestAudioOk = Boolean(res && res.ok);
+      // The recording can end while the capture was still starting — a stall
+      // watchdog, a manual stop, a crash. finalize() has then already run and
+      // deleted the sidecar, so there is nothing left to attach to and nothing
+      // left to stop.
+      const stillRunning = live.list().some((j) => j && j.id === jobId);
+      if (guestAudioOk && stillRunning) {
+        // live owns the ORDER of shutdown: it must not mux (and then delete) the
+        // sidecar while the recorder is still appending to it, so hand it the
+        // stopper it calls from stop() and from its video-close handler.
+        try {
+          live.attachGuestAudio(jobId, {
+            stop: () => {
+              stopGuestAudioCapture();
+            },
+            startedAt: res.startedAt,
+            videoStartedAt: started.startedAt,
+          });
+        } catch (_) {}
+      } else if (guestAudioOk) {
+        guestAudioOk = false;
+        stopGuestAudioCapture();
+      }
+      if (!guestAudioOk) {
+        // NOT fatal. The frame loop is already running; say what happened and fall
+        // back to the CDN track.
+        try {
+          live.jobNote(jobId, `гостевой звук недоступен: ${(res && res.error) || 'запись уже остановлена'} — запись без звука из плеера`);
+        } catch (_) {}
+      }
+    } catch (e) {
+      try {
+        live.jobNote(jobId, `гостевой звук не запустился: ${e.message || e} — запись без звука из плеера`);
+      } catch (_) {}
+    }
   }
 
   if (withChat && resolved.roomId) {
@@ -1424,6 +2071,9 @@ ipcMain.handle('live:start', async (_e, room, opts = {}) => {
     try {
       feed.runInGuest(feed.CHAT_WATCH_SCRIPT).catch(() => {});
     } catch (_) {}
+    // Make sure the WebSocket tap is in place before the room's socket opens,
+    // and start the slow counter poll that proves it is actually running.
+    startChatTapStats();
     // Single guarded ~1s drain timer for this chat session; cleared in
     // finishChat() and on app teardown. runInGuest never throws, pollDomChat
     // never throws — a dead guest just yields empty drains.
@@ -1453,17 +2103,378 @@ ipcMain.handle('live:start', async (_e, room, opts = {}) => {
     if (!chat) chatPoll = clearDomTimer(chatPoll);
   }
 
-  return { ok: true, id: jobId, path: started.path, mode, room: resolved, withChat: Boolean(chat) };
+  return {
+    ok: true,
+    id: jobId,
+    path: started.path,
+    mode,
+    room: resolved,
+withChat: Boolean(chat),
+    // What was actually requested, not what happened — the recording may still
+    // come out silent, which is only knowable after the mux. Screen mode counts
+    // EITHER audio source: the browser capture is preferred, the CDN process is
+    // kept running as the fallback finalize() falls back to.
+    withAudio: mode === 'screen' ? withAudio && (guestAudioOk || Boolean(started.audioUrl)) : mode !== 'screen',
+    // Which of the two actually took. Diagnostic only — nothing in the renderer
+    // reads it, and no renderer change was made for this feature.
+    guestAudio: mode === 'screen' ? guestAudioOk : false,
+  };
 });
+
+// ============================================================================
+// Live chat, source A: the guest's own webcast WebSocket.
+//
+// WHY THE TAP LIVES HERE AND NOT IN THE PRELOAD. It used to live in
+// src/preload/webview-preload.js and was 100% dead — three independent causes,
+// all measured on the real Electron 33.4.11, each fatal on its own:
+//
+//   1. Its primary installer was contextBridge.executeInMainWorld(...). That API
+//      DOES NOT EXIST in Electron 33 (zero hits in electron.d.ts), so the guard
+//      silently fell through to the legacy inline-<script> path.
+//   2. tiktok.com's CSP has no 'unsafe-inline' in script-src, and appendChild()
+//      on a blocked inline script does NOT throw — it never runs. Injection
+//      "succeeded", the page was untouched, and the only symptom was one
+//      armed:false warning.
+//   3. Even installed it would have carried nothing: window.postMessage() from
+//      the MAIN world does NOT reach a 'message' listener in the ISOLATED world
+//      (proven with a live harness — the preload received nothing).
+//
+// What does work, measured on the same build:
+//   * webContents.executeJavaScript(code, true) called from MAIN lands in the
+//     MAIN world and is not subject to the page's CSP  -> installs the tap;
+//   * contextBridge.exposeInMainWorld is the only hop Electron 33 actually
+//     delivers between the two worlds -> __tkmChat in webview-preload.js.
+//   (webFrame.executeJavaScript / executeJavaScriptInIsolatedWorld called from
+//   a preload land in the ISOLATED world, invisible to page scripts — not used.)
+//
+// Deliberately NOT done: nothing is sent on the socket. The page already acks
+// and heartbeats, and a duplicate gets the stream dropped with
+// `1000 payload_handler_hb`.
+// ============================================================================
+
+/**
+ * The tap itself. Runs in the guest's MAIN world, which is why it is a function
+ * rather than an IPC handler: webContents.executeJavaScript below ships it to the
+ * page as SOURCE TEXT (Function.prototype.toString), so it must be completely
+ * self-contained. Referencing any variable from this module would throw a
+ * ReferenceError inside the page, where nothing here could catch it.
+ *
+ * Writes only window.__tkmChatTap and window.__tkmChatStats; the only thing it
+ * ever calls is the preload's contextBridge object. Every error path swallows,
+ * because a chat bug must never break the page it is watching.
+ */
+function chatTapMainWorld() {
+  try {
+    // Idempotent. An SPA route change keeps the same window (and therefore the
+    // same wrapper), so reinstalling here would wrap the wrapper and deliver
+    // every frame twice. A full navigation gets a fresh window, where the flag
+    // is naturally absent again.
+    if (window.__tkmChatTap === true) return 'already';
+  } catch (_) {
+    return 'blocked';
+  }
+
+  var Orig = null;
+  try {
+    Orig = window.WebSocket;
+  } catch (_) {
+    return 'no-websocket';
+  }
+  if (typeof Orig !== 'function') return 'no-websocket';
+
+  var URL_RE = /webcast/i; // TikTok chat lives on wss://…/webcast/im/push/v2/
+  var FLUSH_MS = 250; // a log timestamped by the server does not notice
+  var MAX_BATCH = 64; // one IPC hop per 64 frames, not per frame
+  var MAX_FRAME = 512 * 1024; // a chat frame is KBs; this is backpressure
+  var QUEUE_MAX = 256; // never let a missing bridge grow this without bound
+  var BRIDGE_TRIES = 40; // ~10 s of retries for the preload's contextBridge
+
+  // Bookkeeping for every socket the page opens, not just the chat one: a room
+  // where `matched` is 0 is a different failure from a room where `frames` is 0,
+  // and "the .chat.jsonl is empty" cannot tell them apart. Read back from main
+  // with executeJavaScript('window.__tkmChatStats').
+  var stats = { total: 0, matched: 0, messages: 0, frames: 0, dropped: 0, installedAt: Date.now() };
+  try {
+    window.__tkmChatStats = stats;
+  } catch (_) {}
+
+  var queue = [];
+  var timer = null;
+  var bridgeTries = BRIDGE_TRIES;
+
+  // Re-read the bridge on every flush instead of caching it. The tap installs
+  // from dom-ready, which on a cold navigation can run BEFORE the guest
+  // preload's exposeInMainWorld call lands; caching a null there is exactly how
+  // a perfectly good tap ends up recording nothing for a whole session.
+  var bridge = function () {
+    try {
+      var b = window.__tkmChat;
+      return b && typeof b.post === 'function' ? b : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  var schedule = function () {
+    if (timer || !queue.length) return;
+    try {
+      timer = setTimeout(flush, FLUSH_MS);
+    } catch (_) {
+      timer = null;
+    }
+  };
+
+  var flush = function () {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (!queue.length) return 0;
+    var b = bridge();
+    if (!b) {
+      // The preload has not run yet: KEEP the frames and try again. Dropping
+      // them is how a tap that installed a moment too early looks broken.
+      if (bridgeTries-- > 0) schedule();
+      else queue.length = 0;
+      return 0;
+    }
+    var batch = queue.splice(0, queue.length);
+    try {
+      b.post(batch);
+    } catch (_) {
+      /* a chat bug must never break the page */
+    }
+    return batch.length;
+  };
+
+  var push = function (buf) {
+    try {
+      // Duck-typed rather than `instanceof ArrayBuffer`: a Blob that came back
+      // through arrayBuffer() is a same-realm buffer here, but a page that hands
+      // us a view or a cross-realm buffer would otherwise vanish silently.
+      if (!buf || typeof buf.byteLength !== 'number' || buf.byteLength === 0) {
+        stats.dropped += 1;
+        return;
+      }
+      if (buf.byteLength > MAX_FRAME) {
+        stats.dropped += 1;
+        return;
+      }
+      queue.push(buf);
+      stats.frames += 1;
+      if (queue.length >= MAX_BATCH) flush();
+      else schedule();
+      while (queue.length > QUEUE_MAX) {
+        queue.shift();
+        stats.dropped += 1;
+      }
+    } catch (_) {
+      /* never let capture break the page */
+    }
+  };
+
+  function Tap(url, protocols) {
+    // The spec allows calling the constructor without `new`; behave like the
+    // real one instead of throwing on `this`.
+    if (!(this instanceof Tap)) return new Tap(url, protocols);
+    var ws = protocols === undefined ? new Orig(url) : new Orig(url, protocols);
+    var isChat = false;
+    try {
+      stats.total += 1;
+      isChat = URL_RE.test(String(url));
+      if (isChat) stats.matched += 1;
+    } catch (_) {}
+    // Everything else is left strictly alone: no listener, no timer, no property
+    // writes on a socket the chat does not ride.
+    if (!isChat) return ws;
+
+    // binaryType: 'arraybuffer' is what makes a frame cheap to hand across the
+    // contextBridge, but the page's own decoder may expect Blob — so its choice
+    // always wins. "The caller set one" is not observable at construction time
+    // (the default is already 'blob', and the caller has not run yet), so the
+    // instance gets a binaryType setter for one turn: any assignment made after
+    // `new WebSocket(…)` returns is recorded, and only an untouched socket is
+    // upgraded. The page still reads and writes the real value either way, and
+    // both payload shapes are handled below regardless.
+    var initial = null;
+    var callerSet = false;
+    try {
+      initial = ws.binaryType;
+    } catch (_) {}
+    try {
+      var current = initial;
+      Object.defineProperty(ws, 'binaryType', {
+        configurable: true,
+        enumerable: true,
+        get: function () {
+          return current;
+        },
+        set: function (v) {
+          callerSet = true;
+          current = v;
+        },
+      });
+    } catch (_) {
+      // No interceptor: fall back to "did it differ from what we saw".
+      callerSet = null;
+    }
+    try {
+      setTimeout(function () {
+        try {
+          if (callerSet === null ? ws.binaryType === initial : !callerSet) ws.binaryType = 'arraybuffer';
+        } catch (_) {}
+      }, 0);
+    } catch (_) {}
+
+    try {
+      ws.addEventListener('message', function (ev) {
+        try {
+          stats.messages += 1;
+          var data = ev ? ev.data : null;
+          // Text frames are pongs and acks — no chat in them, and forwarding
+          // them would hand the decoder a payload it must reject.
+          if (typeof data === 'string') return;
+          if (data instanceof ArrayBuffer) return push(data);
+          if (typeof Blob !== 'undefined' && data instanceof Blob) {
+            data.arrayBuffer().then(push, function () {});
+          }
+        } catch (_) {
+          /* never let capture break the page */
+        }
+      });
+    } catch (_) {}
+    return ws;
+  }
+
+  // `new Tap(...)` returns the real socket object, so instanceof and prototype
+  // chains are untouched; sharing the prototype explicitly keeps that true for
+  // libraries that compare constructors.
+  Tap.prototype = Orig.prototype;
+  // WebSocket.CONNECTING/OPEN/CLOSING/CLOSED are read off the constructor by
+  // more than a few libraries, so `new WebSocket()` must stay indistinguishable.
+  Tap.CONNECTING = Orig.CONNECTING;
+  Tap.OPEN = Orig.OPEN;
+  Tap.CLOSING = Orig.CLOSING;
+  Tap.CLOSED = Orig.CLOSED;
+  Tap.__tkmChatTap = true;
+  try {
+    window.WebSocket = Tap;
+  } catch (_) {
+    return 'frozen';
+  }
+  try {
+    window.__tkmChatTap = true;
+  } catch (_) {
+    // Without the flag a re-install would wrap this wrapper. Undo the wrap
+    // rather than risk every frame arriving twice.
+    try {
+      window.WebSocket = Orig;
+    } catch (_) {}
+    return 'frozen';
+  }
+  return 'installed';
+}
+
+// Shipped to the page as source text, because executeJavaScript is the only
+// channel that reaches the MAIN world without the page's CSP getting a vote.
+const CHAT_TAP_SOURCE = `(${chatTapMainWorld.toString()})()`;
+
+// Per-guest install bookkeeping, keyed by webContents id: id -> { url, result }.
+// Deduplicating on the URL is what keeps this from running executeJavaScript
+// dozens of times per navigation — dom-ready, did-navigate-in-page and
+// did-stop-loading all fire for a single load, and the SPA fires them again on
+// every route change.
+const chatTaps = new Map();
+
+/**
+ * Installs the tap in a guest's main world. Never throws: a chat failure must
+ * not take down a recording that is otherwise fine, and the DOM fallback keeps
+ * writing chat files either way.
+ */
+async function installChatTap(wc, urlHint = null) {
+  try {
+    if (!wc || wc.isDestroyed()) return false;
+    let url = urlHint;
+    if (url === null || url === undefined) url = String(wc.getURL() || '');
+    const prev = chatTaps.get(wc.id);
+    if (prev && prev.url === url && (prev.result === 'installed' || prev.result === 'already')) return true;
+
+    let result = '';
+    try {
+      // userGesture is irrelevant here; what matters is that this runs in the
+      // MAIN world and is exempt from the page's CSP.
+      result = String(await wc.executeJavaScript(CHAT_TAP_SOURCE, true));
+    } catch (e) {
+      result = 'error';
+      console.warn('[live-chat] tap install failed:', (e && e.message) || e);
+    }
+    chatTaps.set(wc.id, { url, result });
+    return result === 'installed' || result === 'already';
+  } catch (_) {
+    return false;
+  }
+}
+
+/** installChatTap against the registered feed guest, if there is one. */
+function installChatTapForGuest() {
+  try {
+    return installChatTap(webContents.fromId(Number(feedGuestId)));
+  } catch (_) {
+    return false;
+  }
+}
+
+// The diagnostic that tells us whether the tap is alive on a real live room.
+// Read once per recording: an empty .chat.jsonl is ambiguous (quiet room vs.
+// dead tap), while these counters are not.
+const CHAT_TAP_STATS_MS = 5000;
+let chatTapStats = null;
+let chatTapStatsTimer = null;
+
+async function readChatTapStats() {
+  try {
+    const wc = webContents.fromId(Number(feedGuestId));
+    if (!wc || wc.isDestroyed()) return null;
+    return await wc.executeJavaScript('window.__tkmChatStats || null', true);
+  } catch (_) {
+    return null;
+  }
+}
+
+function startChatTapStats() {
+  installChatTapForGuest();
+  if (chatTapStatsTimer) return;
+  const tick = () => {
+    readChatTapStats().then((stats) => {
+      if (!stats) return;
+      const first = !chatTapStats;
+      chatTapStats = stats;
+      if (first) console.warn('[live-chat] tap stats:', JSON.stringify(stats));
+    });
+  };
+  chatTapStatsTimer = trackDomTimer(setInterval(tick, CHAT_TAP_STATS_MS));
+  if (chatTapStatsTimer && chatTapStatsTimer.unref) chatTapStatsTimer.unref();
+}
+
+function stopChatTapStats() {
+  chatTapStatsTimer = clearDomTimer(chatTapStatsTimer);
+  chatTapStats = null;
+}
+
+// Last-known tap counters, for the renderer's dev console and for diagnosing a
+// recording whose chat file came out empty.
+ipcMain.handle('live:wsStats', () => ({ stats: chatTapStats }));
 
 // ---------- live chat plumbing ----------
 //
 // Two sources feed one ChatSink per recording:
 //
-//  1. the guest's own webcast WebSocket, intercepted in the preload and decoded
-//     below (`live:wsFrames`) — complete, with server-side msgId and createTime;
+//  1. the guest's own webcast WebSocket — tapped by chatTapMainWorld() above,
+//     which main installs into the MAIN world and which hands frames over via
+//     the guest preload's `__tkmChat` contextBridge hop (channel
+//     `live:wsFrames`) — complete, with server-side msgId and createTime;
 //  2. the chat column rendered in the page, drained once a second by
-//     `pollDomChat` — best effort, used when the tap is blocked by CSP or the
+//     `pollDomChat` — best effort, used when the tap cannot install or the
 //     socket is not there.
 //
 // Both write into the same sink, so they de-duplicate against each other: a
@@ -1500,6 +2511,8 @@ function stopAllDomPolls() {
   }
   domPollTimers.clear();
   chatPoll = null;
+  chatTapStatsTimer = null;
+  chatTapStats = null;
   recentChatTexts.clear();
 }
 
@@ -1570,20 +2583,24 @@ async function pollDomChat(roomId) {
 }
 
 // Live chat arrives from the guest webview as raw WebSocket frames (see
-// src/preload/webview-preload.js). They are decoded here because the decoder
-// needs zlib and Buffer, neither of which the sandboxed preload can do cheaply,
-// and because this is where the room-to-recording mapping lives.
+// chatTapMainWorld above and the `__tkmChat` hop in src/preload/webview-preload.js).
+// They are decoded here because the decoder needs zlib and Buffer, neither of
+// which the sandboxed preload can do cheaply, and because this is where the
+// room-to-recording mapping lives.
 //
-// A `send`, not an `invoke`: this fires up to four times a second and nobody
-// waits on a reply.
+// The transport is a `send`, not an `invoke`: up to four times a second and
+// nobody waits on a reply. It arrives here directly from the guest preload's
+// `__tkmChat` bridge — a guest preload is an ordinary renderer, so the batch
+// lands on ipcMain without the app window relaying anything.
 let liveChatEmitAt = new Map();
-ipcMain.on('live:wsFrames', (_e, frames) => {
+function handleWsFrames(frames) {
   if (!Array.isArray(frames) || !frames.length) return;
   let messages = [];
   for (const buf of frames) {
     try {
-      // A frame crosses two IPC hops (postMessage → sendToHost → send) and can
-      // arrive as a plain ArrayBuffer or Uint8Array. eachField() calls
+      // A frame crosses the contextBridge hop and then one IPC hop (contextBridge
+      // clone → ipcRenderer.send), and can arrive as a plain ArrayBuffer or Uint8Array.
+      // eachField() calls
       // readUInt32LE / readBigUInt64LE, which throw on those and would make the
       // decode return [] — the fixed-width branches are exactly where a chat
       // frame's numbers live.
@@ -1605,10 +2622,23 @@ ipcMain.on('live:wsFrames', (_e, frames) => {
   // streams are captured at once, and the other counter would never move.
   const roomIds = new Set(messages.map((m) => m.roomId).filter(Boolean));
   for (const roomId of roomIds) emitChatCount(roomId);
-});
+}
+ipcMain.on('live:wsFrames', (_e, frames) => handleWsFrames(frames));
 
-ipcMain.handle('live:stop', (_e, id) => live.stop(id, 'Остановлено вручную.'));
-ipcMain.handle('live:stopAll', () => ({ stopped: live.stopAll('Остановлено вручную.') }));
+ipcMain.handle('live:stop', (_e, id) => {
+  const r = live.stop(id, 'Остановлено вручную.');
+  // live.stop() already asks the capture to stop through the stopper it was given
+  // at start, but that hook only exists if the capture actually started. Calling it
+  // again is free — stopGuestAudioCapture() is idempotent — and it is the only
+  // thing guaranteeing the open file handle is closed on this path.
+  if (r) stopGuestAudioCapture();
+  return r;
+});
+ipcMain.handle('live:stopAll', () => {
+  const stopped = live.stopAll('Остановлено вручную.');
+  stopGuestAudioCapture();
+  return { stopped };
+});
 ipcMain.handle('live:status', () => live.status());
 
 ipcMain.handle('yt:probeBatch', async (e, urls) => {

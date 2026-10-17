@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <title>guest audio capture</title>
+    <!--
+      No UI, no network, no images: a shell that exists only to give the
+      getDisplayMedia call a same-origin, secure (file:// IS a secure context)
+      document with a live renderer.
+
+      `script-src` is intentionally ABSENT. The recording logic is injected as
+      source text by main through webContents.executeJavaScript(), which Chromium
+      does not subject to the page CSP — the same property the guest chat tap
+      relies on (see chatTapMainWorld in src/main/main.js). Keeping every script
+      source out of the page is therefore both stricter and simpler than trying to
+      hash an inline <script> that would have to be re-hashed on every edit.
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; connect-src 'none'; media-src 'none'; img-src 'none'; style-src 'none'; font-src 'none'; form-action 'none'; base-uri 'none'"
+    />
+  </head>
+  <body>
+    <!-- Intentionally empty: see the CSP note above. -->
+  </body>
+</html>

@@ -240,14 +240,19 @@ const PLAYING_SCRIPT = `(() => {
   * through runInGuest(), which itself never throws.
   *
   * Self-contained IIFE, idempotent via window.__tkmChatWatch. Rows accumulate
-  * in window.__tkmChat (capped, consecutive-duplicate-free) for
-  * CHAT_DRAIN_SCRIPT to collect.
-  */
- const CHAT_WATCH_SCRIPT = `(() => {
-   if (window.__tkmChatWatch) return "already";
-   window.__tkmChatWatch = true;
-   if (!window.__tkmChat) window.__tkmChat = [];
-   var MAX = 500;
+* in window.__tkmDomChat (capped, consecutive-duplicate-free) for
+   * CHAT_DRAIN_SCRIPT to collect.
+   *
+   * The buffer name is NOT __tkmChat: that one belongs to the contextBridge
+   * object exposed by webview-preload.js for the socket tap, and it is an object,
+   * not an array. Reusing it would make `arr.push` throw and silently kill the
+   * DOM fallback that actually works today.
+   */
+  const CHAT_WATCH_SCRIPT = `(() => {
+    if (window.__tkmChatWatch) return "already";
+    window.__tkmChatWatch = true;
+    if (!window.__tkmDomChat) window.__tkmDomChat = [];
+    var MAX = 500;
    var lastAuthor = "##none##";
    var lastText = "##none##";
    var column = null;
@@ -283,8 +288,8 @@ const PLAYING_SCRIPT = `(() => {
      if (author === lastAuthor && text === lastText) return;
      lastAuthor = author;
      lastText = text;
-     var arr = window.__tkmChat;
-     arr.push({ text: text, author: author, time: Date.now() });
+var arr = window.__tkmDomChat;
+      arr.push({ text: text, author: author, time: Date.now() });
      if (arr.length > MAX) arr.splice(0, arr.length - MAX);
    }
    function authorOf(el) {
@@ -451,15 +456,15 @@ const PLAYING_SCRIPT = `(() => {
  })()`;
 
  /**
-  * Returns window.__tkmChat and clears it. Run via runInGuest() (CSP-immune
-  * main-world executeJavaScript), so it works even where page CSP blocks every
-  * other injection channel.
-  */
- const CHAT_DRAIN_SCRIPT = `(() => {
-   var a = window.__tkmChat || [];
-   window.__tkmChat = [];
-   return a;
- })()`;
+* Returns window.__tkmDomChat and clears it. Run via runInGuest() (CSP-immune
+   * main-world executeJavaScript), so it works even where page CSP blocks every
+   * other injection channel.
+   */
+  const CHAT_DRAIN_SCRIPT = `(() => {
+    var a = window.__tkmDomChat || [];
+    window.__tkmDomChat = [];
+    return a;
+  })()`;
 async function installHooks() {
   const res = await runInGuest(HOOK_SCRIPT);
   return res.ok ? res.value : null;

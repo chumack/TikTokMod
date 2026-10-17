@@ -210,268 +210,27 @@ function install() {
 }
 
 // ============================================================================
-// Live chat capture: intercept the WebSocket the page already has open.
+// Live chat capture used to live here. It is gone, and the tap that replaced it
+// must never come back here — see the long note in src/main/main.js
+// (chatTapMainWorld). The short version, all of it measured on Electron
+// 33.4.11, for the three ways an isolated-world tap cannot work:
 //
-// TikTok's live chat rides a protobuf stream over a WebSocket the page opens
-// itself, over the user's own cookies, proxy and UA. Nothing can connect to
-// that socket from outside: the URL is signed by a paid service (Euler Stream
-// in every open-source client) and expires in ~30 s, and there is no REST
-// endpoint for live comments. So the only source that already works — and that
-// always shows exactly what the viewer sees — is the page's own socket.
+//   * contextBridge.executeInMainWorld — the API this file used — DOES NOT EXIST
+//     in Electron 33 (zero hits in node_modules/electron/electron.d.ts), so the
+//     guard fell through to the inline-<script> path;
+//   * tiktok.com's CSP has no 'unsafe-inline' in script-src, and appendChild on
+//     a blocked inline script does NOT throw — it silently never runs, which is
+//     why the only symptom was an armed:false warning;
+//   * even installed, window.postMessage from the MAIN world never reaches a
+//     'message' listener in the ISOLATED world (verified with a live harness),
+//     so the transport carried nothing.
 //
-// The patch has to live in the MAIN world: this preload is an isolated world
-// under contextIsolation, and assigning window.WebSocket there would not touch
-// the object the page uses. An injected <script> does run in the page's world.
-// It must also run before the page's own scripts, which is why the injection
-// happens at preload time and not from a dom-ready hook.
-//
-// Deliberately NOT sent: acks and heartbeats. The page already sends them, and
-// a duplicate gets the socket dropped with `1000 payload_handler_hb`.
-// Deliberately NOT changed: binaryType. Forcing 'arraybuffer' could break the
-// page's own decoder if it expects Blob, so both shapes are handled instead.
+// webFrame.executeJavaScript / executeJavaScriptInIsolatedWorld from a preload
+// are the same dead end: they land in the ISOLATED world, invisible to page
+// scripts. What does work is main-side executeJavaScript(code, true) into the
+// MAIN world, plus the contextBridge hop below. Nothing else about this file's
+// job is chat-related, so the rest of it is untouched.
 // ============================================================================
-
-const WS_CHANNEL = `__tkm_ws_${Math.random().toString(36).slice(2)}`;
-
-(function injectWebSocketTap() {
-  // Self-contained tap: runs in the MAIN world (world 0) with NO closure over
-  // this preload — the channel key arrives through `args`, so the function can
-  // be serialized by contextBridge.executeInMainWorld. It must stay that way:
-  // referencing any outer variable silently breaks the serialization.
-  //
-  // Bookkeeping counts EVERYTHING, not just chat: total sockets opened, how
-  // many matched /webcast/i, and how many message events arrived on ANY socket.
-  // The counters live on window.__tkmChatStats in the MAIN world (readable via
-  // runInGuest, which executes in the main world) and are mirrored into the
-  // live:wsDiag channel, so a future silent failure carries its own diagnosis.
-  const tapMainWorld = function (key) {
-    var stats = window.__tkmChatStats;
-    if (!stats) {
-      stats = { total: 0, matched: 0, messages: 0 };
-      try {
-        window.__tkmChatStats = stats;
-      } catch (_) {}
-    }
-    var Orig = null;
-    try {
-      Orig = window.WebSocket;
-    } catch (_) {
-      Orig = null;
-    }
-    if (!Orig || Orig.__tkmChatTap) {
-      try {
-        window.postMessage({ k: key, hello: true, stats: stats }, '*');
-      } catch (_) {}
-      return 'already';
-    }
-
-    function Tap(url, protocols) {
-      var ws = protocols === undefined ? new Orig(url) : new Orig(url, protocols);
-      var isChat = false;
-      try {
-        stats.total += 1;
-        isChat = /webcast/i.test(String(url));
-        if (isChat) stats.matched += 1;
-      } catch (_) {}
-      var forward = function (buffer) {
-        try {
-          window.postMessage({ k: key, b: buffer }, '*');
-        } catch (_) {
-          /* never let capture break the page */
-        }
-      };
-      ws.addEventListener('message', function (ev) {
-        try {
-          stats.messages += 1;
-        } catch (_) {}
-        if (!isChat) return;
-        var data = ev.data;
-        if (typeof data === 'string') return; // control frame, no chat
-        if (data instanceof ArrayBuffer) return forward(data);
-        if (typeof Blob !== 'undefined' && data instanceof Blob) {
-          data.arrayBuffer().then(forward).catch(function () {});
-        }
-      });
-      return ws;
-    }
-
-    Tap.prototype = Orig.prototype;
-    // WebSocket.CONNECTING/OPEN/CLOSING/CLOSED are static constants, and a few
-    // libraries read them off the constructor. Forwarding keeps `new Tap()`
-    // indistinguishable from `new WebSocket()` for the page.
-    Tap.CONNECTING = Orig.CONNECTING;
-    Tap.OPEN = Orig.OPEN;
-    Tap.CLOSING = Orig.CLOSING;
-    Tap.CLOSED = Orig.CLOSED;
-    Tap.__tkmChatTap = true;
-    try {
-      window.WebSocket = Tap;
-    } catch (_) {
-      return 'frozen';
-    }
-    // Confirm the patch actually EXECUTED. the legacy <script> path below can only tell
-    // that appendChild did not throw — a CSP block does not throw, it just
-    // never runs the script, so injection "succeeds" and chat stays empty
-    // forever. This is the only signal that separates that failure from a
-    // quiet room.
-    try {
-      window.postMessage({ k: key, hello: true, stats: stats }, '*');
-    } catch (_) {}
-    // Heartbeat: evolving counters prove the tap is alive (or stuck) without
-    // waiting for chat traffic. The isolated side throttles these into wsDiag.
-    try {
-      setInterval(function () {
-        try {
-          window.postMessage({ k: key, stats: window.__tkmChatStats }, '*');
-        } catch (_) {}
-      }, 5000);
-    } catch (_) {}
-    return 'installed';
-  };
-
-  // Primary channel: contextBridge.executeInMainWorld runs the function above
-  // in world 0 directly — no <script> element, so page CSP (which on tiktok.com
-  // has no 'unsafe-inline' in script-src) has nothing to block. Electron 33.
-  const tryMainWorld = () => {
-    try {
-      if (
-        typeof contextBridge !== 'undefined' &&
-        contextBridge &&
-        typeof contextBridge.executeInMainWorld === 'function'
-      ) {
-        contextBridge.executeInMainWorld({ func: tapMainWorld, args: [WS_CHANNEL] });
-        return true;
-      }
-    } catch (_) {
-      /* fall through to the legacy <script> path */
-    }
-    return false;
-  };
-
-  // Fallback: the legacy inline-<script> injection for an Electron without
-  // executeInMainWorld. Same function, stringified — still self-contained, the
-  // key still arrives as an argument, not a closure.
-  const attachLegacy = () => {
-    let code = '';
-    try {
-      code = `(${tapMainWorld.toString()})(${JSON.stringify(WS_CHANNEL)})`;
-    } catch (_) {
-      return false;
-    }
-    const el = document.documentElement || document.head || document.body;
-    if (!el) return false;
-    const s = document.createElement('script');
-    s.textContent = code;
-    // CSP on the page can refuse injected scripts; remove ours either way so the
-    // element never lingers in the DOM.
-    try {
-      el.appendChild(s);
-    } catch (_) {
-      return false;
-    }
-    s.remove();
-    return true;
-  };
-
-  if (tryMainWorld()) return;
-  if (attachLegacy()) return;
-  // documentElement is missing this early on some navigations; retry until the
-  // document has a root to attach to. The main-world path is retried too: a
-  // document swap replaces window.WebSocket, so the tap must be re-applied.
-  const timer = setInterval(() => {
-    if (tryMainWorld() || attachLegacy()) clearInterval(timer);
-  }, 50);
-  setTimeout(() => clearInterval(timer), 10000);
-})();
-
-// Isolated-world side: collect frames and ship them to the embedder in small
-// batches. One IPC per frame would be absurd on a busy room; 250 ms of latency
-// is invisible on a chat log that is timestamped by the server anyway.
-(function collectWsFrames() {
-  const queue = [];
-  let timer = null;
-  let lastStatsAt = 0;
-
-  const flush = () => {
-    if (timer) {
-      clearTimeout(timer);
-      timer = null;
-    }
-    if (!queue.length) return;
-    const batch = queue.splice(0, queue.length);
-    try {
-      ipcRenderer.sendToHost('live:wsFrames', batch);
-    } catch (_) {
-      /* embedder gone; drop silently */
-    }
-  };
-
-  // Mirrors the tap's counters into live:wsDiag (throttled): armed:true means
-  // "the tap runs, here is what it sees" — the renderer logs those and only
-  // toasts when armed is false.
-  const sendStats = (stats) => {
-    const now = Date.now();
-    if (now - lastStatsAt < 10000) return;
-    lastStatsAt = now;
-    try {
-      ipcRenderer.sendToHost('live:wsDiag', { armed: true, stats: stats || null });
-    } catch (_) {
-      /* embedder gone */
-    }
-  };
-
-  window.addEventListener('message', (ev) => {
-    const data = ev.data;
-    if (!data || typeof data !== 'object' || data.k !== WS_CHANNEL) return;
-
-    // The injection confirmation below proves the tap is installed, which is
-    // the only thing that distinguishes "the room is quiet" from "the chat tap
-    // never ran". A CSP block or a patched/frozen window.WebSocket both land
-    // here with nothing arriving, and without this the user sees an empty chat
-    // log and no explanation anywhere.
-    if (data.hello) {
-      window.__tkmChatArmed = true;
-      sendStats(data.stats);
-      return;
-    }
-
-    // Heartbeat from the tap (no frame attached): just the counters.
-    if (data.b === undefined) {
-      if (data.stats) sendStats(data.stats);
-      return;
-    }
-
-    // Duck-typed rather than `instanceof ArrayBuffer`: postMessage structurally
-    // clones, so the receiver's own ArrayBuffer is what usually arrives, but a
-    // Uint8Array or a cross-realm buffer would be dropped silently and the
-    // whole feature would look broken.
-    const buf = data.b;
-    if (!buf || typeof buf.byteLength !== 'number') return;
-    // Backpressure: a chat frame is a few KB. Anything this big is not chat,
-    // and forwarding it would hand an unbounded frame to gunzipSync and to
-    // synchronous disk writes on the main thread.
-    if (buf.byteLength > 512 * 1024) return;
-
-    queue.push(buf);
-    if (queue.length >= 64) flush();
-    else if (!timer) timer = setTimeout(flush, 250);
-  });
-
-  // The tap posts `hello` the moment it installs. If that never arrives the
-  // patch is not running — CSP, or the page froze window.WebSocket — and chat
-  // will stay empty no matter how long the recording runs.
-  setTimeout(() => {
-    if (window.__tkmChatArmed) return;
-    try {
-      ipcRenderer.sendToHost('live:wsDiag', {
-        armed: false,
-        reason: 'chat tap did not install (CSP or frozen WebSocket?)',
-      });
-    } catch (_) {
-      /* embedder gone */
-    }
-  }, 6000);
-})();
 
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', install, { once: true });
@@ -494,4 +253,31 @@ contextBridge.exposeInMainWorld('tkmHost', {
   // going through the renderer. Diagnostics only: the main-process handler for
   // this channel paints nothing.
   reportContextMenu: (info) => ipcRenderer.send('feed:guestMenu', info),
+});
+
+// The tap itself is injected by the MAIN process into the MAIN world, because
+// the page's CSP forbids inline scripts and preload-side injection lands in the
+// isolated world where page scripts cannot see it. It hands frames here; this is
+// the only hop between the two worlds that Electron 33 actually delivers.
+// (Verified on 33.4.11: contextBridge.exposeInMainWorld works in both
+// directions, while window.postMessage main-world -> isolated-world does not.)
+//
+// The ONE ipcRenderer.send() here is what keeps the renderer out of the path
+// entirely: a guest preload is an ordinary renderer, so this lands directly on
+// ipcMain.on('live:wsFrames') in main.js and the app window never sees a frame.
+// (sendToHost() was the first choice and is WRONG for this: measured on
+// 33.4.11, a sendToHost from a <webview> guest reaches only the embedder's DOM
+// 'ipc-message' event — neither webContents.on('ipc-message') nor ipcMain sees
+// it — so it would have re-created the renderer relay this is meant to kill.)
+const MAX_WS_BATCH = 64; // same ceiling the tap flushes at
+contextBridge.exposeInMainWorld('__tkmChat', {
+  post: (batch) => {
+    try {
+      // Defensive: this is a page-visible global, so anything on the page can
+      // call it. A non-array, or one absurd batch, must not reach main.
+      if (!Array.isArray(batch) || !batch.length) return;
+      if (batch.length > MAX_WS_BATCH) batch = batch.slice(0, MAX_WS_BATCH);
+      ipcRenderer.send('live:wsFrames', batch);
+    } catch (_) {}
+  },
 });
