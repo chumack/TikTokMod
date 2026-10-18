@@ -1067,6 +1067,25 @@ function buildMenu() {
           click: async () => {
             const exe = binaries.ytdlp();
             if (!exe) return dialog.showErrorBox('yt-dlp', 'Бинарник не найден.');
+
+            // An AppImage mounts its own squashfs read-only (verified:
+            // `fuse.TikTokMod ... ro,nosuid,nodev` in /proc/mounts), so `yt-dlp -U`
+            // there fails every time and the user gets a dialog about an error
+            // they cannot do anything about. Say what is actually true instead
+            // of offering a button that cannot work.
+            if (!canWriteTo(exe)) {
+              return dialog.showMessageBox(win, {
+                type: 'info',
+                message: 'yt-dlp обновляется вместе с приложением',
+                detail:
+                  'Внутри установленного пакета лежит своя копия yt-dlp, и она защищена от записи. ' +
+                  'Обновление придёт с новой версией TikTokMod. Пока обновить движок можно, ' +
+                  'скачав yt-dlp отдельно и указав путь в настройках ' +
+                  '(«Настройки → Папка с yt-dlp / ffmpeg»).',
+                buttons: ['Понятно'],
+              });
+            }
+
             const { spawn } = require('node:child_process');
             const child = spawn(exe, ['-U'], { windowsHide: true });
             child.on('close', async (code) => {
@@ -1160,6 +1179,25 @@ ipcMain.handle('settings:pickDir', async () => {
 ipcMain.handle('settings:reveal', (_e, p) => {
   if (p && fs.existsSync(p)) shell.showItemInFolder(p);
 });
+
+/**
+ * True when a file can actually be modified in place.
+ *
+ * `fs.access(W_OK)` is not enough to answer that: on a root-owned tree the
+ * check passes for a normal user while the write still fails, and inside a
+ * read-only mount it can pass while the filesystem refuses everything. Opening
+ * the file for append is the only probe that matches what `yt-dlp -U` will
+ * actually attempt, and it changes nothing when it succeeds.
+ */
+function canWriteTo(p) {
+  try {
+    const fd = fs.openSync(p, 'r+');
+    fs.closeSync(fd);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 ipcMain.handle('yt:probe', async (_e, url) => {
   const s = settings.get();

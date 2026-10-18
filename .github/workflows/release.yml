@@ -27,7 +27,9 @@ jobs:
           node-version: 20
           cache: npm
 
-      # fuse2  — AppImage runtime needs libfuse.so.2, absent on modern Ubuntu.
+      # libfuse2 — AppImage runtime needs libfuse.so.2, absent on modern Ubuntu.
+      #            (The package is called `fuse2` on Debian only — asking for it
+      #            here fails with "Unable to locate package".)
       # libcrypt1 — the `fpm` binary electron-builder uses to emit .deb links
       #              against its own bundled Ruby.
       # xvfb     — the packaged selftest boots a real Electron window.
@@ -35,13 +37,16 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            fuse2 libfuse2 xvfb libcrypt1 file
+            libfuse2 xvfb libcrypt1 file
 
       - name: Install dependencies
         run: npm ci
 
+      # --publish never: electron-builder otherwise detects CI and tries to
+      # create a draft release itself, which fails without a token. The release
+      # job below is the single place that talks to GitHub.
       - name: Build Linux packages
-        run: npm run dist:linux
+        run: npm run dist:linux -- --publish never
 
       - name: Verify the packaged app
         # Runs the app exactly as it was packaged — not the dev tree — so a
@@ -74,7 +79,7 @@ jobs:
         run: npm ci
 
       - name: Build Windows packages
-        run: npm run dist:win
+        run: npm run dist:win -- --publish never
 
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v4
