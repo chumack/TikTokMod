@@ -114,15 +114,26 @@ jobs:
           TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
         run: |
           cd dist
-          # Keep the source archives electron-builder leaves in the tree out of
-          # the release; everything else is a user-facing installer.
-          shopt -s nullglob
-          files=$(find . -maxdepth 1 -type f \
-            \( -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' \
-               -o -name '*.blockmap' -o -name '*.yml' \) \
-            -printf '%P\n')
-          echo "Releasing $TAG with:"; echo "$files"
-          gh release create "$TAG" $files \
+          # Keep the unpacked app directories out of the release; everything
+          # matching these extensions is a user-facing installer.
+          #
+          # Filenames are collected with mapfile/-d '' rather than $(find): the
+          # Windows artifacts are named "TikTokMod Setup 0.3.1.exe", and word
+          # splitting on a plain `gh release create $files` hands gh three
+          # arguments and dies with "no matches found for `TikTokMod`".
+          mapfile -d '' -t files < <(
+            find . -maxdepth 1 -type f \
+              \( -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' \
+                 -o -name '*.blockmap' -o -name 'latest*.yml' \) \
+              -print0
+          )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No artifacts found — refusing to publish an empty release." >&2
+            exit 1
+          fi
+          printf 'Releasing %s with:\n' "$TAG"
+          printf '  %s\n' "${files[@]}"
+          gh release create "$TAG" "${files[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "TikTokMod $TAG" \
             --generate-notes
