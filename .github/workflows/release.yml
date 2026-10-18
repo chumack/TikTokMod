@@ -133,7 +133,20 @@ jobs:
           fi
           printf 'Releasing %s with:\n' "$TAG"
           printf '  %s\n' "${files[@]}"
-          gh release create "$TAG" "${files[@]}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "TikTokMod $TAG" \
-            --generate-notes
+
+          # Idempotent on purpose: a release workflow gets re-run (a failed
+          # selftest, a corrected build, a manual dispatch on an existing tag),
+          # and a plain `gh release create` aborts with "a release with the
+          # same tag name already exists" instead of updating what is there.
+          # Upload into an existing release and overwrite same-named assets.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG exists — uploading over it."
+            gh release upload "$TAG" "${files[@]}" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "${files[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "TikTokMod $TAG" \
+              --generate-notes
+          fi
