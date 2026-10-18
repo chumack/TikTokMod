@@ -1,0 +1,123 @@
+name: Release
+
+# A tag builds every platform and publishes them as one GitHub Release, so a
+# version never exists for Windows without existing for Linux.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build and release (e.g. v0.4.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Linux (AppImage + deb)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # fuse2  — AppImage runtime needs libfuse.so.2, absent on modern Ubuntu.
+      # libcrypt1 — the `fpm` binary electron-builder uses to emit .deb links
+      #              against its own bundled Ruby.
+      # xvfb     — the packaged selftest boots a real Electron window.
+      - name: Install build/runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fuse2 libfuse2 xvfb libcrypt1 file
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Linux packages
+        run: npm run dist:linux
+
+      - name: Verify the packaged app
+        # Runs the app exactly as it was packaged — not the dev tree — so a
+        # missing bundled binary or a broken resource path fails here instead
+        # of on the user's machine.
+        run: xvfb-run -a ./dist/linux-unpacked/tiktok-mod --selftest
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/*.AppImage
+            dist/*.deb
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  windows:
+    name: Windows (installer + portable)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Windows packages
+        run: npm run dist:win
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/*.exe
+            dist/*.blockmap
+            dist/latest.yml
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: [linux, windows]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: linux
+          path: dist
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: windows
+          path: dist
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          cd dist
+          # Keep the source archives electron-builder leaves in the tree out of
+          # the release; everything else is a user-facing installer.
+          shopt -s nullglob
+          files=$(find . -maxdepth 1 -type f \
+            \( -name '*.AppImage' -o -name '*.deb' -o -name '*.exe' \
+               -o -name '*.blockmap' -o -name '*.yml' \) \
+            -printf '%P\n')
+          echo "Releasing $TAG with:"; echo "$files"
+          gh release create "$TAG" $files \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "TikTokMod $TAG" \
+            --generate-notes

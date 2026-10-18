@@ -3,16 +3,22 @@
   "version": "0.3.1",
   "description": "TikTok desktop client: browse, download without watermark, proxy/region support",
   "main": "src/main/main.js",
-  "author": "",
+  "author": {
+    "name": "chumack",
+    "email": "chumack@users.noreply.github.com"
+  },
   "license": "MIT",
   "private": true,
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
     "postinstall": "node scripts/postinstall.js",
+    "icon": "node scripts/make-icon.js",
     "dist": "electron-builder",
     "dist:win": "electron-builder --win",
-    "dist:linux": "electron-builder --linux"
+    "dist:linux": "electron-builder --linux",
+    "dist:linux:appimage": "electron-builder --linux AppImage",
+    "dist:linux:deb": "electron-builder --linux deb"
   },
   "devDependencies": {
     "electron": "^33.0.0",
@@ -21,6 +27,7 @@
   "build": {
     "appId": "com.tiktokmod.app",
     "productName": "TikTokMod",
+    "beforePack": "scripts/before-pack.js",
     "directories": {
       "output": "dist"
     },
@@ -54,12 +61,19 @@
     "linux": {
       "target": [
         "AppImage",
-        "deb"
+        "deb",
+        "tar.gz"
       ],
+      "icon": "build/icon.png",
       "category": "AudioVideo",
+      "synopsis": "TikTok desktop client",
+      "maintainer": "chumack <chumack@users.noreply.github.com>",
       "desktop": {
         "StartupWMClass": "TikTokMod"
       }
     }
+  },
+  "allowScripts": {
+    "electron": true
   }
 }
