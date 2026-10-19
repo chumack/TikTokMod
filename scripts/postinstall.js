@@ -52,20 +52,31 @@ const FFMPEG = {
     },
   },
   linux: {
-    // johnvansickle publishes static ffmpeg+ffprobe only as a tar.xz that holds
-    // both binaries in a versioned subdirectory. It is the same archive for
-    // both, so the url lives on the container and ffmpeg is pulled out of the
-    // extracted tree.
+    // BtbN/FFmpeg-Builds publishes one tar.xz per platform/arch that holds
+    // ffmpeg, ffprobe and ffplay in a versioned subdirectory.
+    //
+    // It replaces the johnvansickle build this project used before, and the
+    // reason is a crash, not a version number: the johnvansickle binaries are
+    // linked against glibc 2.19 and are FULLY static, so they have no NSS
+    // modules to load and die with SIGSEGV the moment they resolve a name.
+    // Measured on Manjaro: every network input crashed them — a plain
+    // http:// to a local server included — while the same input through the
+    // distro's own ffmpeg wrote megabytes. The crash happens before a single
+    // byte of media is read, so recording a live stream produced an empty
+    // file and the user was told TikTok had delivered nothing.
+    //
+    // The BtbN builds link against the system glibc, so the resolver works.
+    // The LGPL flavour is used: it is smaller and redistributable.
     archive: {
-      url: `https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-${
-        { x64: 'amd64', arm64: 'arm64', arm: 'armv7l', ia32: 'i686' }[process.arch] || 'amd64'
-      }-static.tar.xz`,
+      url: `https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux${
+        { x64: '64', arm64: 'arm64', arm: 'armv7l', ia32: '32' }[process.arch] || '64'
+      }-lgpl.tar.xz`,
     },
     ffmpeg: { name: 'ffmpeg' },
-    // ffprobe is deliberately NOT bundled: it is ~80 MB of static binary and
-    // nothing in the app ever spawns it — binaries.ffprobe() only feeds the
-    // diagnostics panel, and yt-dlp falls back to ffmpeg when it is absent.
-    // Recording and format merging both run through ffmpeg alone.
+    // ffprobe is deliberately NOT bundled: nothing in the app ever spawns it
+    // — binaries.ffprobe() only feeds the diagnostics panel, and yt-dlp falls
+    // back to ffmpeg when it is absent. Recording and format merging both run
+    // through ffmpeg alone.
     ffprobe: { name: 'ffprobe', bundled: false },
   },
   darwin: { ffmpeg: { name: 'ffmpeg', url: null }, ffprobe: { name: 'ffprobe', url: null } },
@@ -110,6 +121,40 @@ async function exists(p) {
   } catch {
     return false;
   }
+}
+
+/**
+ * Checks that a freshly downloaded ffmpeg can actually open a network URL.
+ *
+ * The static build this project used to ship (johnvansickle, 7.0.2, linked
+ * against glibc 2.19) dies with SIGSEGV the moment it resolves a hostname —
+ * measured on Manjaro, EVERY network input crashed it, including a plain
+ * http:// to a local server, while the same input through the distro's own
+ * ffmpeg wrote megabytes. A statically linked glibc has no NSS modules to
+ * dlopen, and this build faults instead of reporting the failure.
+ *
+ * Shipping that binary means every recording of a live stream dies before the
+ * first frame, and the user is told TikTok delivered nothing — while the
+ * actual fault is the file we put there ourselves. So the binary is checked
+ * before it is kept, and a broken one is discarded in favour of the system
+ * ffmpeg.
+ *
+ * The probe uses a hostname on purpose: a literal IP skips the resolver
+ * entirely, which is exactly where the crash lives. The name is in the
+ * reserved ".invalid" TLD, so it never leaves the machine — a healthy ffmpeg
+ * fails the lookup in milliseconds, while the broken one still crashes inside
+ * the resolver it cannot survive. No network traffic, no waiting.
+ */
+function ffmpegWorks(binPath) {
+  const res = spawnSync(
+    binPath,
+    ['-hide_banner', '-loglevel', 'quiet', '-i', 'http://nonexistent.invalid:1/', '-t', '1', '-f', 'null', '-'],
+    { timeout: 20000, stdio: 'pipe' }
+  );
+  if (res.error) return false;
+  // A signal means it crashed. SIGKILL is our own timeout, not a verdict.
+  if (res.signal) return res.signal === 'SIGKILL';
+  return true;
 }
 
 /**
@@ -183,6 +228,15 @@ async function fetchFfmpeg(spec, destDir) {
     console.log('ok');
   } finally {
     fs.rmSync(archivePath, { force: true });
+  }
+
+  // A binary that cannot open a URL is worse than no binary at all: it turns
+  // every live recording into an empty file and blames TikTok for it. Drop it
+  // and let the app use the system ffmpeg instead.
+  const ffmpegPath = path.join(destDir, 'ffmpeg');
+  if (fs.existsSync(ffmpegPath) && !ffmpegWorks(ffmpegPath)) {
+    fs.rmSync(ffmpegPath, { force: true });
+    throw new Error('the downloaded ffmpeg crashes on any network input (SIGSEGV) — discarded');
   }
 }
 

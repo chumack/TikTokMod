@@ -1,6 +1,6 @@
 {
   "name": "tiktok-mod",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "TikTok desktop client: browse, download without watermark, proxy/region support",
   "main": "src/main/main.js",
   "author": {
@@ -56,7 +56,11 @@
       "oneClick": false,
       "perMachine": true,
       "allowToChangeInstallationDirectory": true,
-      "deleteAppDataOnUninstall": true
+      "deleteAppDataOnUninstall": true,
+      "artifactName": "TikTokMod-Setup-${version}-${arch}.${ext}"
+    },
+    "portable": {
+      "artifactName": "TikTokMod-Portable-${version}-${arch}.${ext}"
     },
     "linux": {
       "target": [

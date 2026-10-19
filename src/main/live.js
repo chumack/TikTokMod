@@ -1105,6 +1105,27 @@ function start(id, room, s, { onProgress, onDone, onError } = {}) {
   let out = path.join(dir, `${base}.mp4`);
   for (let n = 2; fs.existsSync(out) && n < 100; n++) out = path.join(dir, `${base}_${n}.mp4`);
 
+  // Stream-mode diagnostics: the screen-mode log (_screen.log) is inert here,
+  // but stream failures need their own trail so a user can send it back.
+  const streamDiagFile = path.join(dir, '_stream.log');
+  const streamJournal = (text) => {
+    const line = `${new Date().toISOString()} ${text}`;
+    try { fs.appendFileSync(streamDiagFile, line + '\n'); } catch (_) {}
+    return line;
+  };
+  streamJournal(`start handle=${room.handle || '?'} mode=stream ` +
+    `stream=${stream ? stream.url.slice(0, 120) : 'none'} `);
+  try {
+    // The ffmpeg path belongs in the log: a build can ship a binary that
+    // crashes on this machine, and "which ffmpeg actually ran" is the first
+    // question worth answering when a recording comes out empty.
+    streamJournal(`ffmpeg exe ${exe}`);
+    streamJournal(`stream url ${stream ? stream.url.slice(0, 160) : 'MISSING'}`);
+    streamJournal(`ffmpeg argv ${JSON.stringify(ffmpegArgs(stream, out))}`);
+  } catch (e) {
+    streamJournal(`journal error: ${e.message}`);
+  }
+
   let child;
   try {
     child = spawn(exe, ffmpegArgs(stream, out), {
@@ -1251,11 +1272,13 @@ child.on('close', (code, signal) => {
         return;
       }
       const tail = job.stderrTail;
+      const urlShort = stream && stream.url ? stream.url.slice(0, 140) : 'неизвестен';
       onError &&
         onError(
           /404 Not Found|403 Forbidden|HTTP error 40[34]/.test(tail)
-            ? 'CDN не отдал поток (404/403). Эфир, возможно, уже закончился, либо закрыт для вашего региона.'
-            : 'Запись пустая — поток не отдал ни одного кадра.'
+            ? `CDN не отдал поток (404/403). Эфир, возможно, уже закончился, либо закрыт для вашего региона. URL: ${urlShort}`
+            : `Запись пустая — поток не отдал ни одного кадра (выходной файл: 0 B). URL: ${urlShort}` +
+              (tail ? ` stderr: ${tail.slice(-300)}` : '')
         );
       return;
     }
