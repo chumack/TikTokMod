@@ -10,6 +10,7 @@ const ytdlp = require('./ytdlp');
 const engine = require('./engine');
 const geo = require('./geo');
 const regions = require('./regions');
+const geobypass = require('./geobypass');
 const ttapi = require('./ttapi');
 const signer = require('./signer');
 const feed = require('./feed');
@@ -735,8 +736,9 @@ async function runSelfTest() {
     if (byProfile.timezone !== 'Europe/Minsk') errors.push(`профиль BY: ожидался Europe/Minsk, получено ${byProfile.timezone}`);
     if (byProfile.timezoneOffset !== 10800) errors.push(`профиль BY: ожидался UTC+3 (10800), получено ${byProfile.timezoneOffset}`);
 
-    // The emulated "SIM" is the whole point: every region field must carry it.
-    const geoSettings = { ...settings.get(), region: 'BY', regionProfile: 'BY', timezone: '' };
+    // The emulated "SIM" is the whole point: in `strict` every region field
+    // carries it, because the phone claims to really be in that country.
+    const geoSettings = { ...settings.get(), region: 'BY', regionProfile: 'BY', timezone: '', bypass: { mode: 'strict' } };
     const ctx = ttapi.context(geoSettings);
     const q = ttapi.buildQuery(ctx.profile, ctx.ident, geoSettings, {});
     const regionFields = ['region', 'current_region', 'sys_region', 'residence', 'carrier_region', 'op_region'];
@@ -751,6 +753,51 @@ async function runSelfTest() {
     }
     log('request region fields:', JSON.stringify(Object.fromEntries(regionFields.map((f) => [f, q[f]]))), 'mcc_mnc=' + q.mcc_mnc);
     log('app UA:', ttapi.appUserAgent(ctx.profile));
+
+    // --- region model (the mechanism of the Android mod, ported) ---
+    // `roaming` must produce MIXED fields: a foreign SIM in a phone that stays
+    // in the real country. Copying one value into all six is exactly the old
+    // behaviour this model exists to replace.
+    const roamSettings = { ...geoSettings, bypass: { mode: 'roaming', localRegion: 'RU' } };
+    const roamCtx = ttapi.context(roamSettings);
+    const rq = ttapi.buildQuery(roamCtx.profile, roamCtx.ident, roamSettings, {});
+    const expectRoam = { carrier_region: 'BY', op_region: 'BY', current_region: 'BY', sys_region: 'RU', residence: 'RU' };
+    for (const [f, want] of Object.entries(expectRoam)) {
+      if (rq[f] !== want) errors.push(`роуминг: ${f} должен быть ${want}, получено ${JSON.stringify(rq[f])}`);
+    }
+    if (rq.mcc_mnc !== '25704') errors.push(`роуминг: mcc_mnc должен остаться 25704 (SIM не менялась), получено ${rq.mcc_mnc}`);
+    if (roamCtx.profile.model.roaming !== true) errors.push('роуминг: модель не отметила состояние как роуминг');
+    log('roaming fields:', JSON.stringify(Object.fromEntries(Object.keys(expectRoam).map((f) => [f, rq[f]]))));
+
+    // Market dispatch: Asian regions live on the c-alisg cluster; asking the
+    // US cluster for them is what returned a trimmed feed.
+    if (regions.marketFor('JP').family !== 'alisg') errors.push('JP должен обслуживаться кластером alisg');
+    if (regions.marketFor('BY').family !== 'useast1a') errors.push('BY должен обслуживаться кластером useast1a');
+    const jpHost = geobypass.apiHost({}, geobypass.project(regions.getProfile('JP'), {}));
+    if (!jpHost.includes('c-alisg')) errors.push('хост для JP должен быть из кластера alisg, получено ' + jpHost);
+    log('market hosts:', regions.marketFor('JP').host + ' / ' + regions.marketFor('BY').host);
+
+    // The CDN region is the server's own answer; observing it is the port of
+    // StoreRegionSource$cdnInterceptor and it must not be silently ignored.
+    geobypass.setRuntime({ ipCountry: null, cdnRegion: null });
+    if (geobypass.observe(new Headers({ 'x-tt-app-cdn-region': 'kz' })) !== 'KZ') {
+      errors.push('заголовок x-tt-app-cdn-region не распознан');
+    }
+    if (geobypass.getRuntime().cdnRegion !== 'KZ') errors.push('регион CDN не сохранён в состоянии');
+    const adopted = geobypass.model(regions.getProfile('BY'), { bypass: { mode: 'strict', adoptCdnRegion: true } });
+    if (adopted.effective !== 'KZ') errors.push('при adoptCdnRegion регион CDN должен побеждать, получено ' + adopted.effective);
+    const cdnAudit = geobypass.audit(geobypass.project(regions.getProfile('BY'), { bypass: { mode: 'strict' } }), { bypass: { mode: 'strict' } });
+    if (!cdnAudit.problems.some((p) => p.code === 'cdn-mismatch')) errors.push('рассогласование с CDN не обнаружено');
+    geobypass.setRuntime({ ipCountry: null, cdnRegion: null });
+
+    // Store-region parameters belong to /passport/** and age-check paths only.
+    const byProjected = geobypass.project(regions.getProfile('BY'), {});
+    const sr = geobypass.storeRegion('passport/app/region/register_region_list', byProjected, {});
+    if (sr.params.reg_store_region !== 'BY') errors.push('reg_store_region должен быть BY, получено ' + sr.params.reg_store_region);
+    if (Object.keys(geobypass.storeRegion('multi/aweme/detail', byProjected, {}).params).length) {
+      errors.push('store-region параметры не должны попадать в обычные запросы');
+    }
+    log('store-region params:', JSON.stringify(sr.params));
 
     // Identity must be stable across calls, or TikTok sees a new phone every time.
     const ident1 = ttapi.ensureIdentity(ctx.ident);
@@ -2725,12 +2772,31 @@ ipcMain.handle('signer:selfTest', () => {
 ipcMain.handle('geo:params', () => {
   const s = settings.get();
   const { profile, ident } = ttapi.context(s);
+  const endpoint = 'multi/aweme/detail';
+  const body = { aweme_ids: '[<video id>]', request_source: '0' };
+  const storeRegion = geobypass.storeRegion(endpoint, profile, s);
   return {
-    endpoint: `POST https://${(s.apiHostname || regions.API_HOSTS[0])}/aweme/v1/multi/aweme/detail/`,
+    endpoint: `POST https://${geobypass.apiHost(s, profile)}/aweme/v1/${endpoint}/`,
     userAgent: ttapi.appUserAgent(profile),
-    body: { aweme_ids: '[<video id>]', request_source: '0' },
-    query: ttapi.buildQuery(profile, ident, s, { aweme_ids: '[<video id>]', request_source: '0' }),
+    body,
+    query: ttapi.buildQuery(profile, ident, s, body),
+    headers: { ...geobypass.requestHeaders(s), ...storeRegion.headers },
+    bypass: geobypass.describe(profile, s),
   };
+});
+
+// The region model of the moment: which country each source reports, which
+// market cluster that resolves to and what the audit makes of the combination.
+ipcMain.handle('geo:bypass', () => {
+  const s = settings.get();
+  const { profile } = ttapi.context(s);
+  return geobypass.describe(profile, s);
+});
+
+ipcMain.handle('geo:bypass:set', (_e, patch) => {
+  const next = settings.set({ bypass: patch || {} });
+  const { profile } = ttapi.context(next);
+  return geobypass.describe(profile, next);
 });
 
 ipcMain.handle('geo:check', async (_e, videoUrl) => {

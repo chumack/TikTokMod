@@ -1393,11 +1393,23 @@ function renderGeoReport(r) {
     ['Ваш IP', r.egress?.country ? `${r.egress.country}${r.egress.ip ? ` (${r.egress.ip})` : ''}` : 'не определён'],
     ['Прокси', r.proxy || 'не задан'],
   ];
+  if (p.sources?.length) {
+    facts.push([
+      'Источники региона',
+      p.sources.map((x) => `${x.label}: ${x.value || '—'}`).join(' · '),
+    ]);
+  }
+  if (p.apiHost) {
+    facts.push(['Кластер API', `${p.market === 'alisg' ? 'Азия/ЛатАм' : 'Европа/Америка'} · ${p.apiHost}`]);
+  }
+  if (r.bypass?.regionHeaders?.length) {
+    facts.push(['Заголовки региона', r.bypass.regionHeaders.join(', ')]);
+  }
   $('#geoFacts').innerHTML = facts
     .map(([k, val]) => `<div class="fact"><span>${escapeHtml(k)}</span><b>${escapeHtml(val)}</b></div>`)
     .join('');
 
-  const notes = [...(r.notes || []), ...((r.consistency && r.consistency.problems) || [])];
+  const notes = [...(r.notes || []), ...((r.audit && r.audit.problems) || [])];
   $('#geoNotes').innerHTML = notes.length
     ? notes.map((n) => `<div class="note ${n.level}"><b>${LEVEL_LABEL[n.level] || ''}</b> ${escapeHtml(n.text)}</div>`).join('')
     : '';
@@ -1406,6 +1418,7 @@ function renderGeoReport(r) {
   $('#geoRegion').value = s.regionProfile || s.region || '';
   $('#geoTimezone').value = s.timezone || '';
   $('#geoProxy').value = s.proxy || '';
+  $('#geoBypassMode').value = p.mode || 'roaming';
   fillCarrierOptions(s.regionProfile || s.region, Number(s.carrierIndex) || 0);
 }
 
@@ -1438,6 +1451,21 @@ $('#geoRegion').addEventListener('change', (e) => {
   fillCarrierOptions(code, 0);
   const p = state.profiles?.find((x) => x.region === code);
   if (p) $('#geoTimezone').value = p.timezone;
+});
+
+$('#geoBypassMode').addEventListener('change', async (e) => {
+  const mode = e.target.value;
+  try {
+    await window.api.geo.setBypass({ mode });
+    const s = await window.api.settings.get();
+    state.settings = s;
+    fillSettings(s);
+    await refreshGeo();
+    toast(`Режим обхода: ${e.target.selectedOptions[0]?.textContent || mode}`, 'ok');
+  } catch (err) {
+    toast('Не удалось сменить режим: ' + err.message, 'err');
+    await refreshGeo();
+  }
 });
 
 $('#geoShowAdvanced').addEventListener('change', (e) => {

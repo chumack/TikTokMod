@@ -70,6 +70,8 @@ contextBridge.exposeInMainWorld('api', {
     profiles: () => invoke('geo:profiles'),
     params: () => invoke('geo:params'),
     check: (videoUrl) => invoke('geo:check', videoUrl),
+    bypass: () => invoke('geo:bypass'),
+    setBypass: (patch) => invoke('geo:bypass:set', patch),
   },
   signer: {
     status: () => invoke('signer:status'),

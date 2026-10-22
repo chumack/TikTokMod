@@ -20,6 +20,20 @@ const DEFAULTS = {
   ttwid: '', // optional: browser-exported ttwid cookie
   msToken: '', // optional: browser-exported msToken cookie
   apiHostname: '', // e.g. api16-normal-c-useast1a.tiktokv.com for mobile API
+  // Region-bypass model (see src/main/geobypass.js). 'roaming' reproduces the
+  // state the Android mod creates: a foreign SIM in a phone that sits in
+  // another country, so carrier_region and sys_region legitimately disagree.
+  bypass: {
+    mode: 'roaming', // off | strict | roaming
+    localRegion: '', // physical country; measured from the IP when empty
+    cdnRegion: '', // last region the CDN reported (x-tt-app-cdn-region)
+    adoptCdnRegion: false, // replace the claim with the CDN's own answer
+    sources: {}, // per-source overrides: { sim, network, system, account }
+    regionHeaders: {}, // captured region SDK header map, replayed on requests
+    storeRegionId: '', // user_selected_region for passport calls
+    storeRegionSourceClient: '',
+    storeRegionSourceApi: '',
+  },
   appInfo: 'musical_ly/35.1.3/2023501030',
   deviceId: '',
   format: 'best', // best | best-no-watermark | worst | custom
@@ -93,6 +107,9 @@ function set(patch) {
   // Keep the signer block shaped: a flat patch from the UI must not wipe the
   // provider/path when it only toggles `enabled`.
   next.signer = { ...DEFAULTS.signer, ...(get().signer || {}), ...(patch.signer || {}) };
+  // Same for the bypass block: the UI patches one switch at a time, and a
+  // shallow merge would drop the captured headers or the local region.
+  next.bypass = { ...DEFAULTS.bypass, ...(get().bypass || {}), ...(patch.bypass || {}) };
   cache = next;
   fs.mkdirSync(path.dirname(SETTINGS_FILE()), { recursive: true });
   fs.writeFileSync(SETTINGS_FILE(), JSON.stringify(cache, null, 2), 'utf8');

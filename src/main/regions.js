@@ -100,6 +100,34 @@ const API_HOSTS = [
   'api.tiktokv.com',
 ];
 
+// TikTok runs two market clusters and the region-control SDK dispatches between
+// them per region: `c-useast1a` for Europe/Americas/Africa, `c-alisg` for
+// Asia-Pacific and Latin America. Asking the wrong cluster for a region returns
+// a trimmed or empty feed even when every region parameter is correct — the Mod
+// Cloud ships a separate market build for exactly this reason.
+const MARKET_HOSTS = {
+  useast1a: 'api16-normal-c-useast1a.tiktokv.com',
+  alisg: 'api16-normal-c-alisg.tiktokv.com',
+};
+
+const ALISG_MARKETS = [
+  'JP', 'KR', 'TW', 'HK', 'TH', 'VN', 'PH', 'ID', 'MY', 'SG',
+  'IN', 'PK', 'BD', 'LK', 'KH', 'LA', 'MM', 'NP', 'MN',
+  'AU', 'NZ', 'BR', 'MX', 'AR', 'CL', 'CO', 'PE',
+];
+
+const MARKET_LABELS = {
+  useast1a: 'Европа / Америка / Африка (c-useast1a)',
+  alisg: 'Азия и Латинская Америка (c-alisg)',
+};
+
+/** Which market cluster serves a region, and its API host. */
+function marketFor(region) {
+  const code = String(region || '').toUpperCase().slice(0, 2);
+  const family = ALISG_MARKETS.includes(code) ? 'alisg' : 'useast1a';
+  return { family, region: code, host: MARKET_HOSTS[family], label: MARKET_LABELS[family] };
+}
+
 /** Current UTC offset in seconds for an IANA zone, DST-aware (Intl/ICU). */
 function tzOffsetSeconds(timezone, at = Date.now()) {
   try {
@@ -209,8 +237,11 @@ module.exports = {
   assessConsistency,
   tzOffsetSeconds,
   carriersFor,
+  marketFor,
   CARRIERS,
   REGION_META,
   API_HOSTS,
+  MARKET_HOSTS,
+  ALISG_MARKETS,
   APP_INFO,
 };

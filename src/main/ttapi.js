@@ -23,6 +23,7 @@
 const crypto = require('node:crypto');
 const { session } = require('electron');
 const regions = require('./regions');
+const geobypass = require('./geobypass');
 const signer = require('./signer');
 
 const randHex = (chars) => crypto.randomBytes(Math.ceil(chars / 2)).toString('hex').slice(0, chars);
@@ -80,7 +81,10 @@ function appUserAgent(profile) {
  */
 function buildQuery(profile, ident, s, extra = {}) {
   const now = Date.now();
-  const versionCode = profile.app_version
+  // `context()` already projects the region model; a bare profile (scripts,
+  // self-test) is projected here so the two entry points cannot drift apart.
+  const p = profile.model ? profile : geobypass.project(profile, s);
+  const versionCode = p.app_version
     .split('.')
     .map((v) => String(parseInt(v, 10)).padStart(2, '0'))
     .join('');
@@ -92,14 +96,14 @@ function buildQuery(profile, ident, s, extra = {}) {
     _rticket: String(now),
     cdid: ident.cdid,
     channel: 'googleplay',
-    aid: profile.aid,
-    app_name: profile.app_name,
+    aid: p.aid,
+    app_name: p.app_name,
     version_code: versionCode,
-    version_name: profile.app_version,
-    manifest_version_code: profile.manifest_app_version,
-    update_version_code: profile.manifest_app_version,
-    ab_version: profile.app_version,
-    build_number: profile.app_version,
+    version_name: p.app_version,
+    manifest_version_code: p.manifest_app_version,
+    update_version_code: p.manifest_app_version,
+    ab_version: p.app_version,
+    build_number: p.app_version,
     resolution: '1080*2400',
     dpi: 420,
     device_type: 'Pixel 7',
@@ -112,21 +116,14 @@ function buildQuery(profile, ident, s, extra = {}) {
     ac2: 'wifi5g',
     is_pad: '0',
     uoo: '1',
-    // ---- the region story: these three are what the SIM hooks would provide ----
-    region: profile.region,
-    current_region: profile.region,
-    sys_region: profile.region,
-    residence: profile.region,
-    carrier_region: profile.region,
-    op_region: profile.region,
-    // operator identity (MCC+MNC of the spoofed SIM)
-    mcc_mnc: profile.carrierMccmnc || '',
-    // locale / timezone must agree with the region or the mix is obvious
-    timezone_name: profile.timezone,
-    timezone_offset: String(profile.timezoneOffset),
-    language: profile.language,
-    locale: profile.language,
-    app_language: profile.language,
+    // ---- the SIM story: one value per region source, as Android reports them ----
+    ...geobypass.queryFields(p),
+    // The clock and the UI language follow the physical location, not the SIM.
+    timezone_name: p.timezone,
+    timezone_offset: String(p.timezoneOffset),
+    language: p.language,
+    locale: p.language,
+    app_language: p.language,
     // identity
     device_id: ident.device_id,
     iid: ident.iid,
@@ -138,10 +135,8 @@ function buildQuery(profile, ident, s, extra = {}) {
   return Object.fromEntries(Object.entries(q).filter(([, v]) => v !== undefined && v !== null && v !== ''));
 }
 
-function apiHost(s) {
-  const h = String(s.apiHostname || '').trim();
-  if (!h) return regions.API_HOSTS[0];
-  return h.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+function apiHost(s, profile) {
+  return geobypass.apiHost(s, profile);
 }
 
 function context(s) {
@@ -151,7 +146,7 @@ function context(s) {
     language: s.navigatorLanguage ? String(s.navigatorLanguage).split('-')[0] : undefined,
   });
   const ident = ensureIdentity(s.emulator);
-  return { profile, ident };
+  return { profile: geobypass.project(profile, s), ident };
 }
 
 // ---------- transport ----------
@@ -161,9 +156,12 @@ function context(s) {
  * without any tunnelling code, and cookies persist across calls.
  */
 async function apiRequest(endpoint, { profile, ident, s, query = {}, body = null, timeout = 20000 }) {
-  const host = apiHost(s);
+  const host = apiHost(s, profile);
   const url = new URL(`https://${host}/aweme/v1/${endpoint}/`);
-  for (const [k, v] of Object.entries(buildQuery(profile, ident, s, query))) {
+  // Store-region parameters ride along on passport/age-check calls only.
+  const storeRegion = geobypass.storeRegion(endpoint, profile, s);
+  const params = { ...buildQuery(profile, ident, s, query), ...storeRegion.params };
+  for (const [k, v] of Object.entries(params)) {
     url.searchParams.set(k, String(v));
   }
 
@@ -180,6 +178,10 @@ async function apiRequest(endpoint, { profile, ident, s, query = {}, body = null
     // yt-dlp sends an empty X-Argus; the mobile API accepts it unsigned.
     'X-Argus': '',
     'X-SS-REQ-TICKET': String(Date.now()),
+    // Header map of the region SDK, when the user captured one, plus the
+    // store-region source markers the passport endpoints expect.
+    ...geobypass.requestHeaders(s),
+    ...storeRegion.headers,
   };
 
   // Optional: only runs when the user turned signing on. A failure here is
@@ -219,6 +221,10 @@ async function apiRequest(endpoint, { profile, ident, s, query = {}, body = null
     }
     throw new Error(`Сеть недоступна: ${e.message}`);
   }
+
+  // The CDN states which region it is serving from; TikTok adopts that header
+  // as the authoritative region source, and so do we.
+  geobypass.observe(res.headers);
 
   const text = await res.text();
   if (!res.ok) throw new Error(await explainStatus(res.status, text, s));
