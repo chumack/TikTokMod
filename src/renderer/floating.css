@@ -114,13 +114,19 @@ webview#player {
   height: 100%;
   background: #000;
   /* A <webview> is composited separately and is not reliably covered by a
-     z-indexed overlay. Keep it hidden until the guest reports a painted video,
-     so the loading/error screen cannot be replaced by an unstyled TikTok page. */
-  visibility: hidden;
+     z-indexed overlay. Keep it transparent until the guest reports a painted
+     video, so the loading/error screen cannot be replaced by an unstyled TikTok
+     page. Opacity is used instead of visibility/display: those can mark the
+     guest document as hidden, and the guest only isolates a video while its
+     document is visible — which would deadlock the first load. */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
 }
 
 webview#player.ready {
-  visibility: visible;
+  opacity: 1;
+  pointer-events: auto;
 }
 
 .loading {

@@ -32,7 +32,7 @@ function fmt(sec) {
 }
 
 function videoId(url) {
-  const m = String(url || '').match(/\/video\/(\d{6,})/);
+  const m = String(url || '').match(/\/(?:video|photo)\/(\d{6,})/);
   return m ? m[1] : '';
 }
 
@@ -210,9 +210,19 @@ function onEnded(payload) {
   if (!payload || !isCurrent(payload)) return;
   // A page can fire ended for a preview or while the next navigation is already
   // starting. Both would skip a clip — the exact "через раз" this replaces.
-  if (Date.now() - state.loadedAt < 1200) return;
+  // Defer instead of dropping: a genuinely short clip that ends inside the
+  // grace window must still advance once the window is over.
   const duration = Number(payload.duration) || 0;
   if (duration > 0 && duration < 0.5) return;
+  const wait = Math.max(0, 1200 - (Date.now() - state.loadedAt));
+  if (wait > 0) {
+    const at = state.loadedAt;
+    setTimeout(() => {
+      if (state.loadedAt !== at || state.busy) return;
+      next();
+    }, wait);
+    return;
+  }
   if (state.busy) return;
   next();
 }

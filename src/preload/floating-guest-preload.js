@@ -528,7 +528,10 @@ function boot() {
 
   window.setInterval(() => {
     watchLocation();
-    if (document.hidden) return;
+    // Once a clip is up, a hidden window needs no work. Before that, isolate
+    // anyway: a brand-new guest can briefly report itself hidden, and skipping
+    // the first isolation would leave the host on the loading screen forever.
+    if (document.hidden && readySent) return;
     scheduleIsolate(0);
     sendTime();
   }, 700);
