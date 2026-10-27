@@ -57,8 +57,27 @@ function send(channel, payload) {
   }
 }
 
+// Original inline values of every property force() has overwritten since the
+// last restore, keyed by element. See restoreHidden().
+const savedStyles = new Map();
+
+function rememberStyle(el, prop) {
+  let saved = savedStyles.get(el);
+  if (!saved) {
+    saved = new Map();
+    savedStyles.set(el, saved);
+  }
+  if (!saved.has(prop)) {
+    saved.set(prop, {
+      value: el.style.getPropertyValue(prop),
+      priority: el.style.getPropertyPriority(prop),
+    });
+  }
+}
+
 function force(el, prop, value) {
   try {
+    rememberStyle(el, prop);
     el.style.setProperty(prop, value, 'important');
   } catch (_) {}
 }
@@ -81,6 +100,11 @@ function currentId() {
  * includes the main player's container. The real clip could then never be
  * painted, and the page would be stuck on a thumbnail. While no large video
  * exists the host's loading overlay is still up, so returning null is invisible.
+ *
+ * The cutoff is a fifth of the viewport, not a token 5%: sidebar previews are
+ * easily 150x200 and would pass a low floor on a small floating window. A real
+ * player (including a 16:9 letterboxed clip in a portrait window) covers well
+ * over a fifth of it.
  */
 function pickVideo() {
   const all = Array.from(document.querySelectorAll('video'));
@@ -103,9 +127,7 @@ function pickVideo() {
       dist: Math.hypot(cx - vw / 2, cy - vh / 2),
     });
   }
-  // 5% of the viewport is well above a sidebar thumbnail and well below the
-  // main player, even when the window is small.
-  const floor = Math.min(vw * vh * 0.05, 20000);
+  const floor = vw * vh * 0.2;
   const large = scored.filter((s) => s.area >= floor);
   if (!large.length) return null;
   large.sort((a, b) => {
@@ -115,6 +137,26 @@ function pickVideo() {
     return a.dist - b.dist;
   });
   return large[0].v;
+}
+
+/**
+ * Puts back every inline property paintChain()/hardenVideo() changed for the
+ * previous clip. Without this a wrong early pick (a big preview, a preloaded
+ * second card) would leave the real player's container display:none forever,
+ * and the clip could never be painted afterwards. Undoing the styles also
+ * un-hides a <video> the page reuses for the next clip, so pickVideo() can see
+ * it again.
+ */
+function restoreHidden() {
+  for (const [el, saved] of savedStyles) {
+    for (const [prop, prev] of saved) {
+      try {
+        if (prev.value) el.style.setProperty(prop, prev.value, prev.priority);
+        else el.style.removeProperty(prop);
+      } catch (_) {}
+    }
+  }
+  savedStyles.clear();
 }
 
 /**
@@ -206,13 +248,12 @@ function hardenVideo(v) {
 }
 
 /**
- * Undoes hardenVideo() for a <video> that is no longer the one on screen.
- *
- * Without this a second large video (TikTok preloads the next card) would keep
- * the fixed full-viewport style and could paint over the chosen clip, and a
- * preview that briefly became the choice would keep playing audio. The element
- * is hidden rather than restored: the page is a decoder here, and once a video
- * was not the main one we do not want it visible again.
+ * Stops a <video> that is no longer the one on screen before the next clip is
+ * painted. The inline styles are put back by restoreHidden(), which runs right
+ * after this: remembering the page's own values (instead of forcing
+ * `display:none`) matters because TikTok reuses the same <video> element for
+ * the next clip — a permanently hidden element has zero area and pickVideo()
+ * would never select it again.
  */
 function releaseVideo(v) {
   if (!v) return;
@@ -220,12 +261,6 @@ function releaseVideo(v) {
     v.pause();
   } catch (_) {}
   if (v.hasAttribute('loop')) v.removeAttribute('loop');
-  for (const prop of Object.keys(VIDEO_STYLE)) {
-    try {
-      v.style.removeProperty(prop);
-    } catch (_) {}
-  }
-  force(v, 'display', 'none');
 }
 
 function showPlayButton() {
@@ -386,6 +421,9 @@ function isolate() {
   const isNew = v !== video;
   if (isNew) {
     releaseVideo(video);
+    // A previous pick may have hidden ancestors of the real player; put them
+    // back before the new chain is painted.
+    restoreHidden();
     video = v;
     endedSent = false;
     // The previous page's play button belongs to the previous clip.
@@ -459,6 +497,8 @@ function watchLocation() {
   lastHref = location.href;
   // A same-document navigation swapped the clip. Treat it as a fresh page so a
   // stale ended flag cannot swallow the new video's end.
+  releaseVideo(video);
+  restoreHidden();
   video = null;
   endedSent = false;
   readySent = false;
