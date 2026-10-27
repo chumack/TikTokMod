@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-src https://www.tiktok.com https://*.tiktok.com; child-src https://www.tiktok.com https://*.tiktok.com"
+    />
+    <title>Плавающий плеер — TikTokMod</title>
+    <link rel="stylesheet" href="floating.css" />
+  </head>
+  <body>
+    <!-- A permanent strip, not an overlay: nothing is drawn on top of the
+         video, so there is no hover scrim to darken it. -->
+    <header class="bar" id="bar">
+      <div class="title" id="title" title="Плавающий плеер">TikTok</div>
+      <div class="nav">
+        <button id="prev" class="icon" title="Предыдущее видео (↑, колесо вверх)" aria-label="Предыдущее видео">‹</button>
+        <button id="play" class="icon" title="Пауза (пробел)" aria-label="Пауза">⏸</button>
+        <button id="next" class="icon" title="Следующее видео (↓, колесо вниз)" aria-label="Следующее видео">›</button>
+      </div>
+      <div class="actions">
+        <button id="return" class="text" title="Вернуться на вкладку «Обзор»">На вкладку</button>
+        <button id="close" class="icon close" title="Закрыть плеер (Esc)" aria-label="Закрыть">✕</button>
+      </div>
+    </header>
+
+    <main class="stage" id="stage">
+      <div class="loading" id="loading">
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="loadingText">Загрузка…</span>
+      </div>
+    </main>
+
+    <footer class="seek-row">
+      <span class="time" id="pos">0:00</span>
+      <input id="seek" type="range" min="0" max="1000" value="0" step="1" aria-label="Позиция видео" />
+      <span class="time" id="dur">0:00</span>
+    </footer>
+
+    <script src="floating.js"></script>
+  </body>
+</html>

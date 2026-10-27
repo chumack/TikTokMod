@@ -816,6 +816,64 @@ async function currentPlaying() {
 }
 
 /**
+ * Pauses whatever the built-in browser is playing, and remembers it, so the
+ * floating player can own the speakers while it is open.
+ *
+ * The marker is an attribute rather than a JS variable on purpose: `runInGuest`
+ * executes a fresh script every time, and an element reference cannot survive
+ * between calls. The attribute also survives a TikTok re-render of the
+ * surrounding card, which is why it is not a WeakSet either.
+ *
+ * Only <video> elements that are actually playing and have real area are
+ * paused. TikTok keeps zero-sized prefetch tags around, and marking those
+ * would make resumeAfterFloating() start a hidden clip later.
+ */
+const FLOAT_PAUSE_SCRIPT = `(() => {
+  let n = 0;
+  for (const v of document.querySelectorAll('video')) {
+    if (v.paused || v.ended) continue;
+    const r = v.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    v.setAttribute('data-tkm-float-paused', '1');
+    try { v.pause(); } catch (_) {}
+    n += 1;
+  }
+  return n;
+})()`;
+
+/**
+ * Resumes exactly the clips pauseForFloating() stopped. A clip that TikTok has
+ * already moved away from is gone with the attribute, so nothing else starts.
+ */
+const FLOAT_RESUME_SCRIPT = `(() => {
+  let n = 0;
+  for (const v of document.querySelectorAll('video[data-tkm-float-paused]')) {
+    v.removeAttribute('data-tkm-float-paused');
+    // The user may have scrolled the tab while the player was open. A marked
+    // clip that is no longer on screen must not start playing next to whatever
+    // TikTok shows now.
+    const r = v.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    try {
+      const p = v.play();
+      if (p && p.catch) p.catch(() => {});
+      n += 1;
+    } catch (_) {}
+  }
+  return n;
+})()`;
+
+async function pauseForFloating() {
+  const res = await runInGuest(FLOAT_PAUSE_SCRIPT);
+  return res.ok ? Number(res.value) || 0 : 0;
+}
+
+async function resumeAfterFloating() {
+  const res = await runInGuest(FLOAT_RESUME_SCRIPT);
+  return res.ok ? Number(res.value) || 0 : 0;
+}
+
+/**
  * Finds LIVE broadcasts reachable from the page currently open in the embedded
  * browser: the room the user navigated to, plus every live link the feed
  * happens to render.
@@ -879,6 +937,8 @@ module.exports = {
   collect,
   currentVideo,
   currentPlaying,
+  pauseForFloating,
+  resumeAfterFloating,
   detectLive,
   installHooks,
   runInGuest,

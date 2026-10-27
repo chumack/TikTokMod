@@ -14,6 +14,7 @@ const geobypass = require('./geobypass');
 const ttapi = require('./ttapi');
 const signer = require('./signer');
 const feed = require('./feed');
+const floating = require('./floating');
 const live = require('./live');
 const livechat = require('./livechat');
 
@@ -26,6 +27,13 @@ let win = null;
 // browser is not open" while the webview is plainly on screen.
 let feedGuestId = null;
 const ALLOWED_HOSTS = /(^|\.)(tiktok\.com|musical\.ly|tiktokcdn\.com|tiktokcdn-us\.com|tiktokv\.com|amemv\.com|byteoversea\.com|tiktokmusic\.com)$/i;
+
+// The floating player opens a second TikTok page from a click in a different
+// window. Chromium's default autoplay policy keys on user activation per
+// document, so that page would sit on a frozen first frame until the user
+// clicked it. The app is a TikTok browser whose feed already plays by itself;
+// allow media playback process-wide.
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
 // Counts every download the session handler cancelled. Exported so the
 // selftest can tell "the event never fired" from "it fired but nothing was
@@ -70,8 +78,10 @@ function createWindow() {
 
   // The hidden audio-capture window must never outlive the main one: it is a
   // BrowserWindow like any other, so leaving it open would stop `window-all-closed`
-  // from ever firing and the app would survive with nothing on screen.
+  // from ever firing and the app would survive with nothing on screen. The same
+  // applies to the floating player, which is also a real window.
   win.on('closed', () => {
+    floating.close();
     destroyGuestAudioWindow();
   });
 
@@ -652,6 +662,10 @@ app.whenReady().then(async () => {
   migrateSettings();
   ensureEmulatorPersisted();
   Menu.setApplicationMenu(buildMenu());
+  // The floating player's IPC has to exist before its window can be opened; the
+  // callback is how it reaches the current main window (createWindow may run
+  // more than once on macOS).
+  floating.install({ getMain: () => win });
   createWindow();
   // Screen mode takes its sound from the guest's own audio track (see the
   // guest-audio block above). Registered once, here, because the handler has to
@@ -1365,6 +1379,56 @@ ipcMain.on('feed:downloadCurrent', async () => {
     url: video.url,
     title: video.title || video.url,
   });
+});
+
+// "Плавающий видеоплеер" from TikTok's own menu. The click is intercepted by
+// src/preload/webview-preload.js and routed here; there is no native PiP in
+// this path any more (see the note there).
+//
+// The queue is seeded with the clip on screen plus the recommendations already
+// rendered in the feed. renderer/floating.js can extend it from each video page
+// and from feed:collect, so opening the player never has to scroll the tab the
+// user is about to return to.
+let floatingToggleBusy = false;
+ipcMain.on('feed:float', async () => {
+  if (floatingToggleBusy) return;
+  floatingToggleBusy = true;
+  try {
+    // The same menu row closes an open player. Doing it here, rather than in
+    // the guest preload, keeps the toggle state in one process.
+    if (floating.isOpen()) {
+      floating.close();
+      return;
+    }
+
+    const current = await feed.currentPlaying();
+    if (!current || !current.ok || !current.video || !current.video.url) {
+      if (win && !win.isDestroyed()) {
+        win.webContents.send('feed:menuAction', {
+          action: 'notice',
+          message:
+            (current && current.error) ||
+            'Не удалось определить ролик на экране. Дождитесь, пока видео начнёт играть, и попробуйте снова.',
+        });
+      }
+      return;
+    }
+
+    const collected = await feed.collect({ previous: [] });
+    const playlist = floating.buildPlaylist(
+      current.video,
+      collected && collected.ok ? collected.items : []
+    );
+    const res = await floating.open({ playlist });
+    if (!res.ok && win && !win.isDestroyed()) {
+      win.webContents.send('feed:menuAction', {
+        action: 'notice',
+        message: res.error || 'Не удалось открыть плавающий плеер.',
+      });
+    }
+  } finally {
+    floatingToggleBusy = false;
+  }
 });
 
 // Absolute file:// URL for the <webview> preload. The renderer cannot build it

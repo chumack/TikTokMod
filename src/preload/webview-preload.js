@@ -64,46 +64,6 @@ const DOWNLOAD_ITEM_RE = /^загрузить\s+видео$/i;
 const FLOATING_ITEM_RE = /^плавающий\s+видеоплеер$|^floating\s+player$/i;
 const FLOATING_ITEM_E2E = 'more-menu-popover_mini-player';
 
-// The <video> the user is actually watching. Ranking mirrors CURRENT_SCRIPT in
-// src/main/feed.js, which was rewritten precisely because area alone is not
-// enough: in TikTok's vertical feed every card has the SAME size and several are
-// in the DOM at once, so an area-only sort falls back to document order and
-// returns the same clip every time. Three keys, in order: playing, then visible
-// area, then distance from the centre of the viewport.
-//
-// Unlike feed.js this returns null when nothing is on screen — NO "first <video>
-// in the document" fallback. The caller must be able to decline the click when
-// there is no clip to float, and a fallback to document order is exactly how you
-// float the wrong one (or a prefetch tag with no data, which throws
-// InvalidStateError). Nothing on screen means: leave the click to TikTok.
-function pickVisibleVideo() {
-  const cx = innerWidth / 2;
-  const cy = innerHeight / 2;
-  const scored = [];
-  for (const v of document.querySelectorAll('video')) {
-    const r = v.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) continue;
-    const visH = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
-    const visW = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
-    const area = visH * visW;
-    if (area <= 0) continue;
-    const mx = r.left + r.width / 2;
-    const my = r.top + r.height / 2;
-    scored.push({
-      v,
-      area,
-      playing: !v.paused && !v.ended && v.readyState > 2,
-      centerDist: Math.hypot(mx - cx, my - cy),
-    });
-  }
-  scored.sort((a, b) => {
-    if (a.playing !== b.playing) return a.playing ? -1 : 1;
-    if (a.area !== b.area) return b.area - a.area;
-    return a.centerDist - b.centerDist;
-  });
-  return scored.length ? scored[0].v : null;
-}
-
 function install() {
   // Guard on the document, not on window: TikTok's SPA swaps the document on
   // route changes, and a listener left on the old one is dead. Re-attaching per
@@ -143,40 +103,23 @@ function install() {
     true
   );
 
-  // "Плавающий видеоплеер" is TikTok's "Floating Player" menu entry. It is a
-  // DOCUMENT Picture-in-Picture feature, not the ordinary video PiP one.
+  // "Плавающий видеоплеер" is TikTok's "Floating Player" menu entry. TikTok
+  // implements it with Document Picture-in-Picture, which Electron has never
+  // supported (electron/electron#39633): the row is rendered because Blink
+  // exposes window.documentPictureInPicture, but openMiniPlayer() returns
+  // silently when the UA sniff fails, and even without the sniff there is no
+  // WebContents behind the pip2 request.
   //
-  // From TikTok's own web bundle (static/js/async/72184.*.js):
-  //   isDocumentPipSupporting = "documentPictureInPicture" in window
-  //     && browser is Chrome/Edge/Opera        <-- a User-Agent sniff
-  //     && /Chrom(e|ium)\/(\d+)/ >= 126 && !== 133
-  //   openMiniPlayer() then does
-  //     if (!isDocumentPipSupporting) return;               <-- silent no-op
-  //     window.documentPictureInPicture.requestWindow({width, height})
-  // The menu ROW is rendered under the looser test `"documentPictureInPicture"
-  // in window`, which Electron 33 / Chromium 130 passes — which is why the item
-  // appears at all. The click then reaches openMiniPlayer(), the UA sniff fails
-  // on `Electron/33.4.11 ...`, and the function returns without doing anything.
+  // Chromium's ordinary <video> PiP is reachable here, and the app used it for
+  // a while, but it is a separate, unstylable window: it cannot switch clips,
+  // it cannot show a "back to tab" button, and the feed auto-advances underneath
+  // it — which is what made playback look like "через раз". So the click is
+  // routed to the app's own floating window instead (src/main/floating.js),
+  // which owns the queue, the controls and the sequential advance.
   //
-  // Two independent reasons it could never work here, in fact:
-  //   1. the UA sniff above, and
-  //   2. Electron has never implemented Document PiP (electron/electron#39633,
-  //      open since Aug 2023, relabelled "enhancement" in Jul 2026): Blink
-  //      exposes window.documentPictureInPicture, but WebContents::AddNewContents()
-  //      returns nullptr for the disposition pip2 hands it, so the child
-  //      WebContents is destroyed and no window is ever created.
-  //
-  // What IS implemented, and reachable from a <webview> guest, is the ordinary
-  // VIDEO Picture-in-Picture API (HTMLVideoElement.requestPictureInPicture) —
-  // WebContents::EnterPictureInPicture(), electron#17686, shipped in Electron 7.
-  // So this handler performs a native PiP on the clip the user is watching. The
-  // result is Chromium's own always-on-top video window, not TikTok's styled
-  // mini-player with its item list: that part is unrecoverable in Electron.
-  //
-  // When it cannot act — native PiP unavailable, or nothing is on screen to
-  // float — the click is deliberately NOT intercepted, so TikTok's own handler
-  // still runs. Swallowing the click there would just reproduce the no-op this
-  // replaces.
+  // The row is always intercepted. Letting the click through would either hit
+  // TikTok's no-op or close a player the user cannot see; main.js instead opens
+  // the app window or reports why it cannot (no clip on screen).
   document.addEventListener(
     'click',
     (event) => {
@@ -185,25 +128,9 @@ function install() {
       const row = target.closest(`[data-e2e="${FLOATING_ITEM_E2E}"]`);
       const text = target.textContent ? target.textContent.trim() : '';
       if (!row && !FLOATING_ITEM_RE.test(text)) return;
-      if (typeof document.exitPictureInPicture !== 'function') return;
-      if (!document.pictureInPictureEnabled) return;
-
-      // Resolve everything BEFORE cancelling: preventDefault() +
-      // stopImmediatePropagation() cannot be undone, so the decision to take the
-      // click over from TikTok must be complete by this point.
-      const closing = Boolean(document.pictureInPictureElement);
-      const video = closing ? null : pickVisibleVideo();
-      if (!closing && (!video || video.disablePictureInPicture)) return;
-
       event.preventDefault();
       event.stopImmediatePropagation();
-
-      // Already floating: the same item closes it again.
-      if (closing) {
-        document.exitPictureInPicture().catch(() => {});
-        return;
-      }
-      video.requestPictureInPicture().catch(() => {});
+      ipcRenderer.send('feed:float');
     },
     true
   );

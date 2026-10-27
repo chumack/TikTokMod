@@ -42,6 +42,7 @@ contextBridge.exposeInMainWorld('api', {
     currentPlaying: () => invoke('feed:currentPlaying'),
     guestPreloadUrl: () => invoke('feed:guestPreloadUrl'),
     onMenuAction: (cb) => on('feed:menuAction', cb),
+    onReturnToTab: (cb) => on('feed:returnToTab', cb),
   },
   live: {
     resolve: (input) => invoke('live:resolve', input),

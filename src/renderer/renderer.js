@@ -826,6 +826,13 @@ window.api.feed.onMenuAction(({ action, url, title, message }) => {
   }
 });
 
+// "На вкладку" in the floating player. Main has already closed the player,
+// resumed the feed clip and focused this window; all that is left is to show
+// the browser tab instead of whichever tab the user was on.
+window.api.feed.onReturnToTab(() => {
+  switchTab('browser');
+});
+
 $('#feedNowBtn').addEventListener('click', () => {
   downloadCurrentFeedVideo().catch((e) => toast(e.message, 'err'));
 });
