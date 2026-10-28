@@ -368,41 +368,6 @@ function markError() {
   send('floating:error', { href: location.href, reason: 'no-video' });
 }
 
-/**
- * Sends the <video> links TikTok has already rendered around the clip. On a
- * video page that is the recommendation column; the host uses them to keep the
- * queue alive after the seeded feed list runs out.
- */
-function collectRelated() {
-  const here = currentId();
-  const seen = new Set();
-  const out = [];
-  let anchors = [];
-  try {
-    anchors = Array.from(document.querySelectorAll('a[href*="/video/"]'));
-  } catch (_) {
-    return;
-  }
-  for (const a of anchors) {
-    const href = a.href || a.getAttribute('href') || '';
-    const m = String(href).match(/\/@([\w.\-]+)\/video\/(\d{6,})/);
-    if (!m) continue;
-    const id = m[2];
-    if (id === here || seen.has(id)) continue;
-    seen.add(id);
-    const img = a.querySelector && a.querySelector('img');
-    out.push({
-      id,
-      handle: m[1],
-      url: 'https://www.tiktok.com/@' + m[1] + '/video/' + id,
-      title: (img && img.alt) || a.getAttribute('aria-label') || '',
-      thumbnail: img ? img.currentSrc || img.src || '' : '',
-    });
-    if (out.length >= 15) break;
-  }
-  if (out.length) send('floating:related', out);
-}
-
 function scheduleIsolate(delay) {
   if (isolateQueued) return;
   isolateQueued = true;
@@ -436,7 +401,6 @@ function isolate() {
   if (wantPlaying && v.paused && !v.ended) safePlay(v);
   if (isNew) {
     markReady();
-    setTimeout(collectRelated, 1200);
   }
 }
 
@@ -579,11 +543,7 @@ function boot() {
   setTimeout(markError, 12000);
   scheduleIsolate(0);
 
-  // Recommendations lazy-load for a while after the video starts.
-  const relatedTimer = window.setInterval(() => {
-    if (!document.hidden) collectRelated();
-  }, 4000);
-  setTimeout(() => window.clearInterval(relatedTimer), 45000);
+  // Disabled by design: floating queue uses main feed only.
 
   window.addEventListener(
     'wheel',

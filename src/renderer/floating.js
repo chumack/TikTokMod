@@ -308,7 +308,9 @@ function onGuestMessage(event) {
       else if (payload && payload.action === 'close') window.floatApi.close();
       break;
     case 'floating:related':
-      merge(payload);
+      // Disabled: recommendations must come only from the main feed
+      // (`feed:more` / `buildPlaylist`), not from the video page's own
+      // sidebar, so the floating queue stays identical to the feed.
       break;
     default:
       break;
