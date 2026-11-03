@@ -270,6 +270,9 @@ function localPipelineCheck() {
 async function localFeedCheck() {
   const http = require('node:http');
   const html = `<!DOCTYPE html><html><body>
+<header style="position:absolute;left:0;top:0;width:800px;height:40px;z-index:9">
+  <a href="/@header/video/7000000000000000098" style="display:block;width:400px;height:40px"><video src="blob:https://www.tiktok.com/h" muted playsinline style="width:400px;height:40px"></video></a>
+</header>
 <div id="now" style="position:absolute;left:0;top:0;width:400px;height:400px;z-index:1">
   <a href="/@now.user/video/7000000000000000009">
     <video src="blob:https://www.tiktok.com/1234-5678" muted playsinline style="width:400px;height:400px"></video>
@@ -284,13 +287,14 @@ async function localFeedCheck() {
   <div style="position:absolute;left:0;top:0;width:400px;height:120px"><a href="/@left.user/video/7000000000000000012"><video src="blob:https://www.tiktok.com/l" muted playsinline style="width:400px;height:120px"></video><img alt="Левый ролик" src="https://p16.example/l.jpg"></a></div>
   <div style="position:absolute;left:400px;top:0;width:400px;height:120px"><a href="/@right.user/video/7000000000000000013"><video src="blob:https://www.tiktok.com/r" muted playsinline style="width:400px;height:120px"></video><img alt="Правый ролик" src="https://p16.example/r.jpg"></a></div>
 </div>
-<div id="feed" style="height:200px;overflow-y:auto">
-  <div data-e2e="scroll-list-item"><a href="/@alpha.one/video/7000000000000000001"><img alt="Первый ролик" src="https://p16.example/a1.jpg"></a><span>1.2M views</span></div>
-  <div data-e2e="scroll-list-item"><a href="/@beta/video/7000000000000000002"><img alt="Второй ролик" src="https://p16.example/a2.jpg"></a><span>45K просмотров</span></div>
-  <div data-e2e="scroll-list-item"><a href="/@gamma/photo/7000000000000000003"><img alt="Фото-пост" src="https://p16.example/a3.jpg"></a></div>
-  <div data-e2e="scroll-list-item"><a href="/@alpha.one/video/7000000000000000001"><img alt="Дубль" src="https://p16.example/a1.jpg"></a></div>
-  <div data-e2e="scroll-list-item"><a href="/@page/about">Не видео</a></div>
-  ${'<div style="height:300px">заполнитель</div>'.repeat(6)}
+<div id="feed" style="position:relative;height:200px;overflow-y:auto">
+  <div style="position:absolute;left:0;top:120px;width:300px;height:50px"><a href="/@gamma/video/7000000000000000004" style="display:block;width:300px;height:50px"><img width="300" height="50" alt="Третий ролик" src="https://p16.example/a4.jpg"></a><span>3.4K просмотров</span></div>
+  <div style="position:absolute;left:0;top:0;width:300px;height:50px"><a href="/@alpha.one/video/7000000000000000001" style="display:block;width:300px;height:50px"><img width="300" height="50" alt="Первый ролик" src="https://p16.example/a1.jpg"></a><span>1.2M views</span></div>
+  <div style="position:absolute;left:0;top:60px;width:300px;height:50px"><a href="/@beta/video/7000000000000000002" style="display:block;width:300px;height:50px"><img width="300" height="50" alt="Второй ролик" src="https://p16.example/a2.jpg"></a><span>45K просмотров</span></div>
+  <div style="position:absolute;left:0;top:180px;width:300px;height:50px"><a href="/@gamma/photo/7000000000000000003" style="display:block;width:300px;height:50px"><img width="300" height="50" alt="Фото-пост" src="https://p16.example/a3.jpg"></a></div>
+  <div style="position:absolute;left:0;top:0;width:300px;height:50px"><a href="/@alpha.one/video/7000000000000000001" style="display:block;width:300px;height:50px"><img width="300" height="50" alt="Дубль" src="https://p16.example/a1.jpg"></a></div>
+  <div style="position:absolute;left:0;top:60px;width:300px;height:50px"><a href="/@page/about" style="display:block;width:300px;height:50px">Не видео</a></div>
+  <div style="height:900px;width:1px"></div>
 </div></body></html>`;
 
   const server = http.createServer((_req, res) => {
@@ -312,20 +316,32 @@ async function localFeedCheck() {
         if (!first.ok) return finish({ ok: false, reason: first.error, summary: { ok: false } });
         // The merge path must grow the list instead of replacing it.
         const second = await feed.collect({ previous: first.items });
-        // "Догрузить ещё" only helps if the feed container actually moves.
-        const scrolled = await feed.collect({ scroll: true, previous: second.items });
+        // "Догрузить ещё" only helps if the feed container actually moves; it
+        // must then be put back so the tab does not jump.
+        const scrolled = await feed.collect({ scroll: true, restore: true, previous: second.items });
 
         const summary = {
           first: first.total,
           second: second.total,
           scrolled: scrolled.scrolled,
+          restored: scrolled.restored,
           ids: first.items.map((i) => i.id).join(','),
         };
         const v1 = first.items.find((i) => i.id === '7000000000000000001');
         const photo = first.items.find((i) => i.id === '7000000000000000003');
-        if (first.total !== 8) return finish({ ok: false, reason: `ожидалось 8 уникальных видео, получено ${first.total}`, summary });
-        if (second.total !== 8) return finish({ ok: false, reason: `повторный сбор должен сохранять 8, получено ${second.total}`, summary });
+        // Visual order inside #feed is A(0) B(60) C(120) photo(180), while the
+        // DOM order is C A B photo. The collector must return A B C photo.
+        if (first.total !== 4) return finish({ ok: false, reason: `ожидалось 4 карточки ленты, получено ${first.total}`, summary });
+        if (second.total !== 4) return finish({ ok: false, reason: `повторный сбор должен сохранять 4, получено ${second.total}`, summary });
+        if (first.items.map((i) => i.id).join(',') !== '7000000000000000001,7000000000000000002,7000000000000000004,7000000000000000003') {
+          return finish({ ok: false, reason: 'порядок очереди не совпал с визуальным порядком ленты: ' + summary.ids, summary });
+        }
+        const outside = ['7000000000000000009', '7000000000000000011', '7000000000000000012', '7000000000000000013', '7000000000000000098'];
+        if (first.items.some((i) => outside.includes(i.id))) {
+          return finish({ ok: false, reason: 'в очередь попали карточки вне ленты: ' + summary.ids, summary });
+        }
         if (!(scrolled.scrolled > 0)) return finish({ ok: false, reason: `прокрутка не сработала: ${scrolled.scrolled}`, summary });
+        if (!(scrolled.restored > 0)) return finish({ ok: false, reason: `позиция ленты не восстановлена: ${scrolled.restored}`, summary });
         if (!v1 || v1.handle !== 'alpha.one') return finish({ ok: false, reason: 'handle не извлечён: ' + JSON.stringify(v1), summary });
         if (!v1 || v1.url !== 'https://www.tiktok.com/@alpha.one/video/7000000000000000001') {
           return finish({ ok: false, reason: 'url не собран: ' + JSON.stringify(v1), summary });
@@ -1385,12 +1401,42 @@ ipcMain.on('feed:downloadCurrent', async () => {
 // src/preload/webview-preload.js and routed here; there is no native PiP in
 // this path any more (see the note there).
 //
-// The queue is seeded with the clip on screen plus the recommendations already
-// rendered in the feed. renderer/floating.js can extend it from each video page
-// and from feed:collect, so opening the player never has to scroll the tab the
-// user is about to return to.
+// The click handler sends the href of the card the user opened the menu on
+// (resolved from the visible <video>, like the old PiP path did). That id is
+// the first clip of the queue — this is what keeps the player on the clip the
+// user clicked instead of whatever a DOM heuristic guessed a moment later.
+// The queue itself is the feed in visual order (see feed.js COLLECT_SCRIPT).
 let floatingToggleBusy = false;
-ipcMain.on('feed:float', async () => {
+let lastGuestMenu = { href: '', at: 0 };
+
+/**
+ * Parses a TikTok clip link into the queue's item shape. Anything that is not
+ * an absolute tiktok.com /@handle/(video|photo)/<id> URL is rejected: the page
+ * can send arbitrary text over IPC, so it is not trusted as a URL.
+ */
+function clipFromHref(href) {
+  try {
+    const u = new URL(String(href || ''));
+    if (!/(^|\.)tiktok\.com$/i.test(u.hostname)) return null;
+    const m = u.pathname.match(/^\/@([\w.\-]+)\/(video|photo)\/(\d{6,})\/?$/);
+    if (!m) return null;
+    return {
+      id: m[3],
+      handle: m[1],
+      isPhoto: m[2] === 'photo',
+      url: 'https://www.tiktok.com/@' + m[1] + '/' + m[2] + '/' + m[3],
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function floatNotice(message) {
+  if (!win || win.isDestroyed()) return;
+  win.webContents.send('feed:menuAction', { action: 'notice', message });
+}
+
+ipcMain.on('feed:float', async (_event, ctx) => {
   if (floatingToggleBusy) return;
   floatingToggleBusy = true;
   try {
@@ -1401,31 +1447,53 @@ ipcMain.on('feed:float', async () => {
       return;
     }
 
-    const current = await feed.currentPlaying();
-    if (!current || !current.ok || !current.video || !current.video.url) {
-      if (win && !win.isDestroyed()) {
-        win.webContents.send('feed:menuAction', {
-          action: 'notice',
-          message:
-            (current && current.error) ||
-            'Не удалось определить ролик на экране. Дождитесь, пока видео начнёт играть, и попробуйте снова.',
-        });
+    // 1. The card under the click. 2. The last card TikTok's own context menu
+    // reported (a right-click followed by the menu row). 3. The on-screen clip
+    // at the click coordinates. 4. currentPlaying().
+    let target = clipFromHref(ctx && ctx.href);
+    if (!target && lastGuestMenu.href && Date.now() - lastGuestMenu.at < 30000) {
+      target = clipFromHref(lastGuestMenu.href);
+    }
+
+    let video = null;
+    if (target) {
+      if (target.isPhoto) {
+        floatNotice('Это фото-пост — плавающий плеер воспроизводит только видео.');
+        return;
       }
-      return;
+      video = target;
+    } else if (ctx && ctx.point === true) {
+      const at = await feed.currentVideo(Number(ctx.x) || 0, Number(ctx.y) || 0);
+      if (at && at.ok && at.video) video = feed.videoFromCurrent(at.video);
+    }
+
+    if (!video) {
+      const current = await feed.currentPlaying();
+      if (!current || !current.ok || !current.video || !current.video.url) {
+        floatNotice(
+          (current && current.error) ||
+            'Не удалось определить ролик на экране. Дождитесь, пока видео начнёт играть, и попробуйте снова.'
+        );
+        return;
+      }
+      if (current.video.isPhoto) {
+        floatNotice('Это фото-пост — плавающий плеер воспроизводит только видео.');
+        return;
+      }
+      video = current.video;
     }
 
     const collected = await feed.collect({ previous: [] });
-    const playlist = floating.buildPlaylist(
-      current.video,
+    const built = floating.buildPlaylist(
+      video,
       collected && collected.ok ? collected.items : []
     );
-    const res = await floating.open({ playlist });
-    if (!res.ok && win && !win.isDestroyed()) {
-      win.webContents.send('feed:menuAction', {
-        action: 'notice',
-        message: res.error || 'Не удалось открыть плавающий плеер.',
-      });
+    if (!built.items.length) {
+      floatNotice('Не удалось открыть этот ролик: не нашлась его ссылка в ленте.');
+      return;
     }
+    const res = await floating.open({ playlist: built.items, index: built.index });
+    if (!res.ok) floatNotice(res.error || 'Не удалось открыть плавающий плеер.');
   } finally {
     floatingToggleBusy = false;
   }
@@ -1441,13 +1509,18 @@ ipcMain.handle('feed:guestPreloadUrl', () => {
 
 // Right-click reported from inside the guest (see src/preload/webview-preload.js).
 //
-// Diagnostics only. The app paints no menu on a right-click, so there is
-// nothing to decide here and nothing to send back — the handler is deliberately
-// empty. The channel is kept because runSelfTest()'s localPopupCheck() listens
-// on it to prove the guest preload is attached, and an unattached preload is
-// otherwise invisible: «Загрузить видео» still "works" through the will-download
-// cancellation in createWindow(), so it can never be used as proof.
-ipcMain.on('feed:guestMenu', () => {});
+// The app paints no menu on a right-click, but the report carries the link under
+// the cursor. It is kept as a fallback for the "Плавающий видеоплеер" row: if
+// the click handler cannot resolve the visible card, this is the last card the
+// user pointed at. localPopupCheck() also listens on this channel to prove the
+// guest preload is attached.
+ipcMain.on('feed:guestMenu', (event, info) => {
+  if (!info || typeof info.linkURL !== 'string') return;
+  if (feedGuestId && event && event.sender && event.sender.id !== feedGuestId) return;
+  if (/\/@[\w.\-]+\/(?:video|photo)\/\d{6,}/.test(info.linkURL)) {
+    lastGuestMenu = { href: info.linkURL, at: Date.now() };
+  }
+});
 
 // ---------- LIVE recording ----------
 

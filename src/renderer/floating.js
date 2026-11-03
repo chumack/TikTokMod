@@ -12,12 +12,15 @@ const state = {
   guestPreload: '',
   wv: null,
   loadedAt: 0,
+  readyAt: 0,
   duration: 0,
   current: 0,
   paused: true,
   seeking: false,
   busy: false,
   errorStreak: 0,
+  wrongTries: 0,
+  wantedId: '',
   wheelAcc: 0,
   wheelLast: 0,
   wheelAt: 0,
@@ -39,15 +42,21 @@ function videoId(url) {
 function sameVideo(a, b) {
   const ia = videoId(a);
   const ib = videoId(b);
-  if (ia && ib) return ia === ib;
-  return true;
+  // Two URLs without an id are NOT the same clip. The old `return true` made
+  // "https://www.tiktok.com/foryou" equal to every video, so a redirect, a
+  // login wall or a recommendation page was accepted as the current clip and
+  // its state (time, ended, errors) drove the queue.
+  return Boolean(ia && ib && ia === ib);
 }
 
 function isCurrent(payload) {
   const item = state.playlist[state.index];
   if (!item) return false;
-  if (!payload || !payload.href) return true;
-  return sameVideo(payload.href, item.url);
+  if (!payload) return false;
+  const id = String(payload.id || videoId(payload.href) || '');
+  // A message that names no clip proves nothing; treating it as "current" is
+  // how a foreign page used to inject its own ended/time events.
+  return Boolean(id && id === String(item.id || videoId(item.url)));
 }
 
 function showLoading(text, isError = false) {
@@ -100,6 +109,11 @@ function merge(items) {
     const id = item.id ? String(item.id) : '';
     if (!id) continue;
     if (seen.has(id)) continue;
+    // The same rule as buildPlaylist: only canonical clip pages can be loaded
+    // in the guest. `@_` ids and bare /video/<id> links land on an account-not-
+    // found page and used to poison the queue.
+    if (item.handle === '_' || /\/@_\//.test(item.url)) continue;
+    if (!/^https:\/\/www\.tiktok\.com\/@[^/]+\/video\/\d{6,}/.test(item.url)) continue;
     seen.add(id);
     state.playlist.push({
       id,
@@ -122,12 +136,17 @@ async function grow() {
   return state.playlist.length > before;
 }
 
-function load(index, { first = false } = {}) {
+function load(index, { first = false, retry = false } = {}) {
   const item = state.playlist[index];
   if (!item) return;
 
+  // A retry of the same clip keeps wrongTries, so the second miss advances
+  // instead of reloading forever. Anything else is a new clip.
+  if (!retry) state.wrongTries = 0;
   state.index = index;
   state.loadedAt = Date.now();
+  state.readyAt = 0;
+  state.wantedId = String(item.id || videoId(item.url) || '');
   state.duration = 0;
   state.current = 0;
   // A new clip starts playing by itself; the guest reports the real state
@@ -138,8 +157,8 @@ function load(index, { first = false } = {}) {
   $('#pos').textContent = '0:00';
   $('#dur').textContent = '0:00';
   setPlayIcon(true);
-  setMeta({ href: item.url, handle: item.handle, title: item.title });
-  showLoading('Загрузка…');
+  setMeta({ href: item.url, id: item.id, handle: item.handle, title: item.title });
+  showLoading(retry ? 'TikTok открыл другой ролик — пробую ещё раз…' : 'Загрузка…', retry);
 
   const wv = state.wv;
   if (!wv) return;
@@ -160,7 +179,7 @@ function load(index, { first = false } = {}) {
   }
 }
 
-async function next() {
+async function next(auto = false) {
   if (state.busy || !state.playlist.length) return;
   state.busy = true;
   try {
@@ -168,9 +187,21 @@ async function next() {
       load(state.index + 1);
       return;
     }
-    await grow();
-    if (state.index + 1 < state.playlist.length) load(state.index + 1);
-    else load(0);
+    // The end of the queue is not a reason to wrap around: load(0) replayed the
+    // first clips and made the player look like a different, short feed. Ask the
+    // main feed for more instead; when it has nothing, stop on the last clip.
+    const before = state.playlist.length;
+    const grew = await grow();
+    if (state.playlist.length > before && state.index + 1 < state.playlist.length) {
+      load(state.index + 1);
+      return;
+    }
+    showLoading(
+      auto
+        ? 'Очередь закончилась — вернитесь на вкладку, чтобы догрузить ленту.'
+        : 'Дальше в ленте пока ничего нет — прокрутите вкладку и попробуйте снова.',
+      false
+    );
   } finally {
     setTimeout(() => {
       state.busy = false;
@@ -180,9 +211,11 @@ async function next() {
 
 function prev() {
   if (state.busy || !state.playlist.length) return;
+  // Wrapping to the last clip made "previous" jump to the bottom of the feed.
+  if (state.index <= 0) return;
   state.busy = true;
   try {
-    load(state.index > 0 ? state.index - 1 : state.playlist.length - 1);
+    load(state.index - 1);
   } finally {
     setTimeout(() => {
       state.busy = false;
@@ -214,21 +247,45 @@ function onEnded(payload) {
   // grace window must still advance once the window is over.
   const duration = Number(payload.duration) || 0;
   if (duration > 0 && duration < 0.5) return;
-  const wait = Math.max(0, 1200 - (Date.now() - state.loadedAt));
+  // The grace window is measured from the moment the guest reported a painted
+  // clip, not from navigation. A page that buffered for three seconds used to
+  // spend its whole window on loading, so a stale ended from the previous clip
+  // advanced immediately.
+  const since = state.readyAt || state.loadedAt;
+  const wait = Math.max(0, 1200 - (Date.now() - since));
   if (wait > 0) {
     const at = state.loadedAt;
     setTimeout(() => {
       if (state.loadedAt !== at || state.busy) return;
-      next();
+      next(true);
     }, wait);
     return;
   }
   if (state.busy) return;
-  next();
+  next(true);
+}
+
+function onWrongPage(payload) {
+  // The guest stayed on a different clip (removed video, region block, login
+  // wall). Retry the requested clip once; a second miss advances instead of
+  // leaving the player on a stranger's video.
+  if (!state.wv) return;
+  if (state.wrongTries >= 1) {
+    state.wrongTries = 0;
+    next(true);
+    return;
+  }
+  state.wrongTries += 1;
+  showLoading('TikTok открыл другой ролик — пробую ещё раз…', true);
+  const at = state.loadedAt;
+  setTimeout(() => {
+    if (state.loadedAt !== at || state.busy) return;
+    load(state.index, { retry: true });
+  }, 700);
 }
 
 function onGuestError(payload) {
-  if (payload && payload.href && !isCurrent(payload)) return;
+  if (payload && (payload.id || payload.href) && !isCurrent(payload)) return;
   if (state.wv) state.wv.classList.remove('ready');
   state.errorStreak += 1;
   // Six failed clips in a row is a network/region problem, not a bad video.
@@ -243,7 +300,7 @@ function onGuestError(payload) {
   showLoading('Видео не открылось — пропускаю…', true);
   const at = state.loadedAt;
   setTimeout(() => {
-    if (state.loadedAt === at) next();
+    if (state.loadedAt === at) next(true);
   }, 2200);
 }
 
@@ -282,7 +339,9 @@ function onGuestMessage(event) {
   switch (event.channel) {
     case 'floating:ready':
       if (isCurrent(payload)) {
+        state.readyAt = Date.now();
         state.errorStreak = 0;
+        state.wrongTries = 0;
         if (state.wv) state.wv.classList.add('ready');
         hideLoading();
       }
@@ -298,6 +357,9 @@ function onGuestMessage(event) {
       break;
     case 'floating:error':
       onGuestError(payload);
+      break;
+    case 'floating:wrongPage':
+      onWrongPage(payload);
       break;
     case 'floating:wheel':
       onWheel(payload);
@@ -350,6 +412,11 @@ async function boot() {
   wv.setAttribute('webpreferences', 'backgroundThrottling=no');
   wv.addEventListener('ipc-message', onGuestMessage);
   wv.addEventListener('dom-ready', () => {
+    // Tell the guest which clip this document must show BEFORE it isolates one.
+    // TikTok serves "video unavailable" pages that still contain a <video> from
+    // the recommendation column; painting that would play a stranger's clip.
+    const item = state.playlist[state.index];
+    if (item) sendCmd({ type: 'want', id: item.id, url: item.url });
     try {
       wv.send('floating:ping');
     } catch (_) {}

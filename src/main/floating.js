@@ -61,14 +61,16 @@ function install({ getMain } = {}) {
 
   ipcMain.handle('floating:guestPreloadUrl', () => pathToFileURL(GUEST_PRELOAD).href);
 
-  // The renderer can extend its queue from the feed that is already rendered.
-  // No scrolling: opening the player must not move the tab the user is coming
-  // back to. The guest page itself also contributes related clips.
+  // The renderer can extend its queue from the feed. The feed has to scroll for
+  // TikTok to render the next batch; collect() puts the tab back where it was,
+  // so the clip the user is watching stays on screen. Scrolling starts autoplay
+  // in the tab, hence the pause afterwards.
   ipcMain.handle('floating:more', async (_e, previous) => {
     const prev = Array.isArray(previous) ? previous : [];
-    const res = await feed.collect({ previous: prev });
+    const res = await feed.collect({ previous: prev, scroll: true, restore: true });
     if (!res || !res.ok) return { ok: false, items: prev, error: res && res.error };
-    return { ok: true, items: res.items };
+    await feed.pauseForFloating();
+    return { ok: true, items: res.items, added: res.added };
   });
 
   ipcMain.on('floating:return', () => returnToTab());
@@ -78,59 +80,108 @@ function install({ getMain } = {}) {
 /**
  * Builds the initial queue.
  *
- * The clip on screen comes first. The rest of the feed follows in document
- * order, but only the clips AFTER the current one are "рекомендации" in the
- * sense the user sees them; the ones above are appended at the end so a short
- * feed still has something to switch to. Photo posts are dropped: they have no
- * <video> to float.
+ * The queue is the collected feed order, and `index` points at the clip the
+ * user clicked. There is no rotation: rotating around the current clip moved
+ * the whole queue "up" the feed and made the player look like a different
+ * feed. Clips above the current one stay in front of it and are reached only
+ * with "previous".
+ *
+ * Returns { items, index }. An empty list means the clicked clip could not be
+ * resolved to a canonical /@handle/video/<id> URL; the caller must say so
+ * instead of opening some other clip.
  */
 function buildPlaylist(current, collected, limit = 60) {
   const out = [];
   const seen = new Set();
 
   const push = (item) => {
-    if (!item || !item.id || !item.url) return;
-    if (item.isPhoto) return;
+    if (!item || !item.id) return false;
+    if (item.isPhoto) return false;
     const id = String(item.id);
-    if (seen.has(id)) return;
-    if (out.length >= limit) return;
+    if (seen.has(id)) return false;
+    // Collect everything and apply `limit` as a window at the end: cutting here
+    // dropped a clicked clip that sat beyond the first `limit` cards, and the
+    // player then refused to open a video that was plainly on screen.
+    if (out.length >= 200) return false;
+    const handle = item.handle || '';
+    const url = item.url || '';
+    // A page-derived item can carry '@_' when only the numeric id was known.
+    // That is fine for yt-dlp but a webview gets an account-not-found page, so
+    // the clip is not queued at all.
+    if (!handle || handle === '_' || /\/@_\//.test(url)) return false;
+    if (/\/photo\//.test(url)) return false;
+    if (!/^https:\/\/www\.tiktok\.com\/@[^/]+\/(?:video|photo)\/\d{6,}/.test(url)) return false;
     seen.add(id);
     out.push({
       id,
-      handle: item.handle || '',
-      url: item.url,
+      handle,
+      url,
       title: item.title || '',
       thumbnail: item.thumbnail || '',
     });
+    return true;
   };
 
   const items = Array.isArray(collected) ? collected.filter(Boolean) : [];
   const currentId = current && current.id ? String(current.id) : '';
 
-  // PLAYING_SCRIPT falls back to '@_' when it can only resolve the numeric id.
-  // That is fine for yt-dlp (it reads the id) but a webview needs a real handle
-  // or TikTok may serve an account-not-found page. The feed usually renders the
-  // same clip's canonical anchor, so borrow it when it is there.
+  // The collected card is the canonical source for handle/url/title: the click
+  // path may only know the numeric id.
   let first = current;
   if (first && currentId) {
     const match = items.find((i) => String(i.id) === currentId);
-    const weak = !first.url || /\/@_\//.test(first.url) || !first.handle;
-    if (match && match.url && weak) {
+    if (match) {
       first = {
         ...first,
         handle: match.handle || first.handle,
-        url: match.url,
+        url: match.url || first.url,
         title: first.title || match.title || '',
+        thumbnail: first.thumbnail || match.thumbnail || '',
       };
     }
   }
 
-  push(first);
-  const at = currentId ? items.findIndex((i) => String(i.id) === currentId) : -1;
-  const ordered = at >= 0 ? items.slice(at + 1).concat(items.slice(0, at)) : items;
-  for (const item of ordered) push(item);
+  let list = items.slice();
+  let at = currentId ? list.findIndex((i) => String(i.id) === currentId) : -1;
 
-  return out;
+  if (at >= 0) {
+    const photo = Boolean((first && first.isPhoto) || list[at].isPhoto);
+    list[at] = { ...list[at], ...first, isPhoto: photo };
+  } else if (currentId && first) {
+    // The collector did not see the current card (it may have been recycled
+    // between the click and the read). Fall back to the clips below it when a
+    // scroll offset is known; otherwise the current clip stands alone rather
+    // than being replaced by whatever happens to be first in the list.
+    const pos = Number(first.pos);
+    if (Number.isFinite(pos)) {
+      const below = list.findIndex((i) => Number.isFinite(Number(i.pos)) && Number(i.pos) > pos);
+      list = below >= 0 ? list.slice(below) : [];
+      list.unshift(first);
+      at = 0;
+    } else {
+      list = [first];
+      at = 0;
+    }
+  } else if (!currentId) {
+    at = -1;
+  }
+
+  for (const item of list) push(item);
+
+  if (currentId) {
+    const index = out.findIndex((i) => i.id === currentId);
+    if (index < 0) return { items: [], index: 0 };
+    if (out.length > limit) {
+      // Keep the current clip inside the window; otherwise a long feed would
+      // start at the top and the click target would be cut off.
+      const start = Math.max(0, Math.min(out.length - limit, index - Math.floor(limit / 2)));
+      const window = out.slice(start, start + limit);
+      return { items: window, index: index - start };
+    }
+    return { items: out, index };
+  }
+
+  return { items: out, index: 0 };
 }
 
 function clamp(value, min, max) {

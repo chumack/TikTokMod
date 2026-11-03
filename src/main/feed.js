@@ -33,28 +33,144 @@ function guest() {
  * Script injected into the webview. Must be self-contained: it runs in the
  * page's main world with no access to our modules.
  *
- * Collects anchors that point at a video, plus whatever metadata the DOM
- * already exposes (thumbnail, author, caption, view count). Returns plain JSON.
+ * Collects the feed's cards in the order they appear ON SCREEN, plus whatever
+ * metadata the DOM already exposes (thumbnail, author, caption, view count).
+ *
+ * Two things matter here, and both were wrong before:
+ *
+ *  - the feed's scroll container, not the whole document. TikTok renders the
+ *    signed-in user's header, the navigation rail and the recommendation
+ *    sidebar next to the feed; anchors from those are not "the feed" and used
+ *    to be queued as if they were;
+ *  - visual order, not DOM order. React recycles feed cards, so a node created
+ *    later can sit above one created earlier. The queue follows the viewport
+ *    rect, which is exactly what the user sees.
  */
 const COLLECT_SCRIPT = `(() => {
   const out = [];
   const seen = new Set();
-  const anchors = document.querySelectorAll('a[href*="/video/"], a[href*="/photo/"]');
-  for (const a of anchors) {
-    const href = a.getAttribute('href') || '';
-    const m = href.match(/\\/@([\\w.\\-]+)\\/(?:video|photo)\\/(\\d{6,})/);
-    if (!m) continue;
-    const id = m[2];
-    if (seen.has(id)) continue;
-    seen.add(id);
+  const A_RE = 'a[href*="/video/"], a[href*="/photo/"]';
+  const ID_RE = /\\/@([\\w.\\-]+)\\/(video|photo)\\/(\\d{6,})/;
 
-    // The card is the anchor's nearest ancestor that holds the thumbnail.
-    let card = a;
-    for (let i = 0; i < 4 && card.parentElement; i++) {
-      if (card.parentElement.querySelector('img')) { card = card.parentElement; break; }
-      card = card.parentElement;
+  const parse = (a) => {
+    const href = (a && a.getAttribute && a.getAttribute('href')) || '';
+    const m = href.match(ID_RE);
+    if (!m) return null;
+    return { id: m[3], handle: m[1], kind: m[2], photo: m[2] === 'photo' };
+  };
+
+  const anchors = Array.from(document.querySelectorAll(A_RE));
+
+  // A card is the anchor's nearest ancestor that holds exactly this one video
+  // anchor and a thumbnail. Never an ancestor with several cards: that is the
+  // feed itself, and its first image belongs to a different clip.
+  const cardOf = (a) => {
+    let el = a;
+    for (let i = 0; i < 6 && el && el !== document.body; i += 1, el = el.parentElement) {
+      if (!el.querySelectorAll) continue;
+      const own = el.querySelectorAll(A_RE);
+      if (own.length === 1 && el.querySelector('img')) return el;
     }
-    const img = card.querySelector('img') || a.querySelector('img');
+    return a;
+  };
+
+  const rectOf = (a) => {
+    try {
+      return a.getBoundingClientRect();
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const scrollable = (n) => {
+    try {
+      const oy = getComputedStyle(n).overflowY;
+      if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') return false;
+      return n.scrollHeight > n.clientHeight + 40;
+    } catch (_) {
+      return false;
+    }
+  };
+
+  // The feed is the scroll box that holds the clip currently on screen. Picking
+  // the largest scrollable box instead used to select whatever column happened
+  // to be tallest; on a video page that can be the recommendation sidebar.
+  const currentScroll = () => {
+    const vids = [];
+    for (const v of document.querySelectorAll('video')) {
+      const r = v.getBoundingClientRect();
+      const w = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+      const h = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+      const area = w * h;
+      if (area > 0) vids.push({ v, area });
+    }
+    vids.sort((a, b) => b.area - a.area);
+    for (const { v } of vids) {
+      let el = v.parentElement;
+      for (let i = 0; i < 20 && el && el !== document.body; i += 1, el = el.parentElement) {
+        if (!scrollable(el)) continue;
+        for (const a of anchors) if (el.contains(a)) return el;
+      }
+    }
+    return null;
+  };
+
+  let root = currentScroll();
+
+  // No playing <video> yet (first load, a photo-only feed): the scroll box with
+  // the most distinct clip anchors is the feed.
+  if (!root) {
+    let bestCount = 0;
+    for (const n of document.querySelectorAll('div, main, section')) {
+      if (!scrollable(n)) continue;
+      let count = 0;
+      const local = new Set();
+      for (const a of anchors) {
+        if (!n.contains(a)) continue;
+        const p = parse(a);
+        if (p && !local.has(p.id)) { local.add(p.id); count += 1; }
+      }
+      if (count > bestCount) { bestCount = count; root = n; }
+    }
+    if (bestCount < 2) root = null;
+  }
+  if (!root) root = document.body;
+
+  const included = anchors.filter((a) => {
+    if (!root.contains(a)) return false;
+    if (root === document.body && a.closest('header, nav, aside')) return false;
+    const r = rectOf(a);
+    if (!r || r.width <= 0 || r.height <= 0) return false;
+    return true;
+  });
+
+  const scroller = root === document.body
+    ? (document.scrollingElement || document.documentElement)
+    : root;
+  const baseTop = scroller ? Number(scroller.scrollTop) || 0 : 0;
+  const baseLeft = scroller ? Number(scroller.scrollLeft) || 0 : 0;
+
+  const rows = [];
+  for (const a of included) {
+    const p = parse(a);
+    if (!p) continue;
+    const r = rectOf(a);
+    if (!r) continue;
+    rows.push({ a, p, r });
+  }
+  rows.sort((x, y) => {
+    const dy = Math.round(x.r.top) - Math.round(y.r.top);
+    if (dy) return dy;
+    return Math.round(x.r.left) - Math.round(y.r.left);
+  });
+
+  for (const row of rows) {
+    const { a, p, r } = row;
+    if (seen.has(p.id)) continue;
+    seen.add(p.id);
+
+    const card = cardOf(a);
+    const img = (card.querySelector && card.querySelector('img')) || a.querySelector('img');
     const text = (card.innerText || '').trim();
 
     // Views are rendered as "12.3M", "1.2K views", "45K просмотров" — parse the
@@ -68,15 +184,20 @@ const COLLECT_SCRIPT = `(() => {
     }
 
     out.push({
-      id,
-      handle: m[1],
-      url: 'https://www.tiktok.com/@' + m[1] + '/video/' + id,
+      id: p.id,
+      handle: p.handle,
+      url: 'https://www.tiktok.com/@' + p.handle + '/' + p.kind + '/' + p.id,
       thumbnail: img ? (img.currentSrc || img.src || '') : '',
       // The card's own alt/aria text is the caption in most TikTok layouts.
       title: (img && img.alt) || a.getAttribute('aria-label') || (text.split('\\n')[0] || '').slice(0, 120),
       viewCount,
-      isPhoto: href.includes('/photo/'),
+      isPhoto: p.photo,
+      // Offset inside the scroll container. buildPlaylist uses it only when the
+      // current clip was not part of the collected window.
+      pos: baseTop + r.top,
+      left: baseLeft + r.left,
     });
+    if (out.length >= 200) break;
   }
   return out;
 })()`;
@@ -85,22 +206,91 @@ const COLLECT_SCRIPT = `(() => {
  * Script that scrolls the feed so more items render. TikTok's feed is an
  * infinite scroll container, so scrolling its own element is more reliable than
  * scrolling the window.
+ *
+ * It also remembers which element and which offset it moved, so collect() can
+ * put the tab back where the user left it. Growing the floating queue must not
+ * scroll the feed away under the user.
  */
 const SCROLL_SCRIPT = `(() => {
-  const nodes = Array.from(document.querySelectorAll('div'));
-  let target = document.scrollingElement;
-  let best = -1;
-  for (const n of nodes) {
-    if (n.scrollHeight <= n.clientHeight + 40) continue;
-    const area = n.clientWidth * n.clientHeight;
-    if (area > best) { best = area; target = n; }
+  const A_RE = 'a[href*="/video/"], a[href*="/photo/"]';
+  const anchors = Array.from(document.querySelectorAll(A_RE));
+  const scrollable = (n) => {
+    try {
+      const oy = getComputedStyle(n).overflowY;
+      if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') return false;
+      return n.scrollHeight > n.clientHeight + 40;
+    } catch (_) {
+      return false;
+    }
+  };
+
+  let target = null;
+  const vids = [];
+  for (const v of document.querySelectorAll('video')) {
+    const r = v.getBoundingClientRect();
+    const w = Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0));
+    const h = Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0));
+    const area = w * h;
+    if (area > 0) vids.push({ v, area });
   }
+  vids.sort((a, b) => b.area - a.area);
+  for (const { v } of vids) {
+    let el = v.parentElement;
+    for (let i = 0; i < 20 && el && el !== document.body; i += 1, el = el.parentElement) {
+      if (!scrollable(el)) continue;
+      for (const a of anchors) if (el.contains(a)) { target = el; break; }
+      if (target) break;
+    }
+    if (target) break;
+  }
+
+  if (!target) {
+    let bestCount = 0;
+    for (const n of document.querySelectorAll('div, main, section')) {
+      if (!scrollable(n)) continue;
+      let count = 0;
+      const local = new Set();
+      for (const a of anchors) {
+        if (!n.contains(a)) continue;
+        const m = (a.getAttribute('href') || '').match(/\\/(?:video|photo)\\/(\\d{6,})/);
+        if (m && !local.has(m[1])) { local.add(m[1]); count += 1; }
+      }
+      if (count > bestCount) { bestCount = count; target = n; }
+    }
+  }
+  if (!target) {
+    let area = -1;
+    for (const n of document.querySelectorAll('div')) {
+      if (n.scrollHeight <= n.clientHeight + 40) continue;
+      const a = n.clientWidth * n.clientHeight;
+      if (a > area) { area = a; target = n; }
+    }
+  }
+  if (!target) target = document.scrollingElement;
   if (!target) return 0;
+
+  window.__tkmScrollEl = target;
+  window.__tkmScrollBefore = target.scrollTop;
   const before = target.scrollTop;
   target.scrollTop = before + Math.round(target.clientHeight * 0.9);
   // Some layouts only react to a wheel event.
   target.dispatchEvent(new WheelEvent('wheel', { deltaY: 1200, bubbles: true }));
   return target.scrollTop - before;
+})()`;
+
+/**
+ * Puts the feed back where SCROLL_SCRIPT found it. Without this, "extend the
+ * floating queue" would scroll the tab the user is about to return to, so the
+ * clip they were watching would no longer be on screen.
+ */
+const RESTORE_SCROLL_SCRIPT = `(() => {
+  const el = window.__tkmScrollEl;
+  if (!el || !el.isConnected) return 0;
+  const before = Number(el.scrollTop) || 0;
+  const want = Math.max(0, Number(window.__tkmScrollBefore) || 0);
+  el.scrollTop = want;
+  window.__tkmScrollEl = null;
+  return before - want;
 })()`;
 
 /**
@@ -162,8 +352,11 @@ const PLAYING_SCRIPT = `(() => {
     });
   }
   scored.sort((a, b) => {
-    if (a.playing !== b.playing) return a.playing ? -1 : 1;
+    // Visibility first: a playing clip that has already scrolled off screen is
+    // not what the user is looking at. Ranking by playing alone used to return
+    // the previous card after the feed advanced.
     if (a.inView !== b.inView) return a.inView ? -1 : 1;
+    if (a.playing !== b.playing) return a.playing ? -1 : 1;
     return b.area - a.area;
   });
   const best = scored[0] || null;
@@ -173,7 +366,7 @@ const PLAYING_SCRIPT = `(() => {
   }
 
   // Walk up from the on-screen <video>: the id can sit on the wrapper element
-  // (xgwrapper-<idx>-<postId>) or on any ancestor anchor.
+  // (xgwrapper-<idx>-<postId>) or on an ancestor anchor.
   if (best) {
     let el = best.v;
     for (let i = 0; i < 25 && el; i++) {
@@ -182,13 +375,22 @@ const PLAYING_SCRIPT = `(() => {
         const tail = own.split('-').pop();
         if (/^\\d{6,}$/.test(tail)) { out.id = tail; break; }
       }
-      const wrap = el.querySelector && el.querySelector('[id^="xgwrapper-"]');
-      if (wrap) {
-        const tail = wrap.id.split('-').pop();
-        if (/^\\d{6,}$/.test(tail)) { out.id = tail; break; }
+      // An anchor is only trustworthy while the chain still belongs to ONE
+      // card. On a shared feed container querySelector returns the first anchor
+      // in document order — a different clip — which is how the floating player
+      // used to open the wrong video.
+      const self = el.matches && el.matches('a[href*="/video/"], a[href*="/photo/"]') ? el : null;
+      if (self && take(self.getAttribute('href'))) break;
+      const alone = el.querySelectorAll && el.querySelectorAll('video').length === 1;
+      if (alone) {
+        const wrap = el.querySelector('[id^="xgwrapper-"]');
+        if (wrap) {
+          const tail = wrap.id.split('-').pop();
+          if (/^\\d{6,}$/.test(tail)) { out.id = tail; break; }
+        }
+        const a = el.querySelector('a[href*="/video/"], a[href*="/photo/"]');
+        if (a && take(a.getAttribute('href'))) break;
       }
-      const a = (el.matches && el.matches('a[href*="/video/"]')) || (el.querySelector && el.querySelector('a[href*="/video/"]'));
-      if (a && take(a.getAttribute('href'))) break;
       el = el.parentElement;
     }
   }
@@ -219,8 +421,19 @@ const PLAYING_SCRIPT = `(() => {
     if (!out.method) out.method = 'dom';
   }
 
-  const cap = document.querySelector('[data-e2e="video-desc"], [data-e2e="browse-video-desc"], [data-e2e="video-title"]');
-  if (cap) out.title = (cap.textContent || '').trim().slice(0, 120);
+  // Caption scoped to the card that owns THIS video. A document-wide query
+  // returns the first card's caption and used to label the wrong clip.
+  if (best) {
+    let card = best.v;
+    for (let i = 0; i < 8 && card && card.parentElement; i += 1) {
+      card = card.parentElement;
+      if (card.querySelectorAll && card.querySelectorAll('video').length === 1) break;
+    }
+    const cap =
+      card.querySelector &&
+      card.querySelector('[data-e2e="video-desc"], [data-e2e="browse-video-desc"], [data-e2e="video-title"]');
+    if (cap) out.title = (cap.textContent || '').trim().slice(0, 120);
+  }
 
   out.videos = scored.length;
   return out;
@@ -539,8 +752,12 @@ function waitForDomReady(wc, timeout = 8000) {
 /**
  * Collects the videos rendered in the browser tab, merging with what was
  * already gathered so repeated clicks grow the list instead of replacing it.
+ *
+ * `scroll` makes TikTok render the next batch. `restore` (used by the floating
+ * player) puts the tab back where it was first: growing the queue must not move
+ * the clip the user is watching.
  */
-async function collect({ scroll = false, previous = [] } = {}) {
+async function collect({ scroll = false, restore = false, previous = [] } = {}) {
   await installHooks();
   let url = '';
   const u = await runInGuest('location.href');
@@ -554,9 +771,24 @@ async function collect({ scroll = false, previous = [] } = {}) {
     await new Promise((r) => setTimeout(r, 1800));
   }
 
-  const res = await runInGuest(COLLECT_SCRIPT);
-  if (!res.ok) return res;
-  const items = Array.isArray(res.value) ? res.value : [];
+  let res = null;
+  let items = [];
+  let failure = null;
+  let restored = null;
+  try {
+    res = await runInGuest(COLLECT_SCRIPT);
+    if (!res || !res.ok) failure = res || { ok: false, error: 'Страница не ответила.' };
+    else items = Array.isArray(res.value) ? res.value : [];
+  } finally {
+    if (scroll && restore) {
+      // Let the scrolled batch settle before moving the tab back. The items are
+      // already read above, so restoring cannot lose them.
+      await new Promise((r) => setTimeout(r, 120));
+      const back = await runInGuest(RESTORE_SCROLL_SCRIPT);
+      if (back.ok) restored = back.value;
+    }
+  }
+  if (failure) return failure;
 
   const merged = new Map();
   for (const it of previous) if (it && it.id) merged.set(it.id, it);
@@ -567,6 +799,7 @@ async function collect({ scroll = false, previous = [] } = {}) {
     ok: true,
     url,
     scrolled,
+    restored,
     total: all.length,
     added: all.length - (previous.length || 0),
     items: all,
@@ -765,7 +998,12 @@ const CURRENT_SCRIPT = `(() => {
   }
 
   if (!out.url && out.vid) {
-    out.url = 'https://www.tiktok.com/video/' + out.vid;
+    out.url =
+      'https://www.tiktok.com/@' +
+      (out.handle || '_') +
+      '/' +
+      (out.isPhoto ? 'photo/' : 'video/') +
+      out.vid;
   }
   if (!out.title) {
     const t = (document.title || '').trim();
@@ -796,12 +1034,48 @@ async function currentVideo(x, y) {
 }
 
 /**
+ * Converts a CURRENT_SCRIPT result into the queue's item shape. Kept next to
+ * currentPlaying() because the click path in main.js resolves coordinates with
+ * currentVideo() directly and must produce the same shape.
+ */
+function videoFromCurrent(v) {
+  if (!v || !v.vid) return null;
+  const isPhoto = Boolean(v.isPhoto);
+  const handle = v.handle || '';
+  const url =
+    v.url ||
+    'https://www.tiktok.com/@' + (handle || '_') + (isPhoto ? '/photo/' : '/video/') + v.vid;
+  return {
+    id: String(v.vid),
+    handle,
+    url,
+    title: v.title || '',
+    thumbnail: v.thumb || '',
+    isPhoto,
+    playing: Boolean(v.playing),
+    src: v.srcUrl || null,
+  };
+}
+
+/**
  * Resolves the video the app is showing right now, whatever state the feed is in.
  *
  * It never waits for the feed: the user wants whatever is on screen, and TikTok
  * renders anchors to /video/<id> continuously while more cards stream in.
+ *
+ * CURRENT_SCRIPT is the primary resolver (same one as the right-click path): it
+ * ranks by visible area and resolves the anchor of THAT element. PLAYING_SCRIPT
+ * is only a fallback for pages where CURRENT_SCRIPT finds no <video> at all —
+ * it used to be the primary and could return an off-screen or neighbouring
+ * card, which is exactly how the floating player opened a different clip.
  */
 async function currentPlaying() {
+  const cur = await currentVideo();
+  if (cur && cur.ok && cur.video) {
+    const mapped = videoFromCurrent(cur.video);
+    if (mapped) return { ok: true, video: mapped };
+  }
+
   const res = await runInGuest(PLAYING_SCRIPT);
   if (!res.ok) return res;
   const v = res.value;
@@ -937,6 +1211,7 @@ module.exports = {
   collect,
   currentVideo,
   currentPlaying,
+  videoFromCurrent,
   pauseForFloating,
   resumeAfterFloating,
   detectLive,
@@ -945,6 +1220,7 @@ module.exports = {
   setWebviewId,
   COLLECT_SCRIPT,
   SCROLL_SCRIPT,
+  RESTORE_SCROLL_SCRIPT,
   CURRENT_SCRIPT,
   PLAYING_SCRIPT,
   LIVE_SCRIPT,

@@ -63,6 +63,67 @@ const DOWNLOAD_ITEM_RE = /^загрузить\s+видео$/i;
 // The text is only a fallback for locales whose label we do not know.
 const FLOATING_ITEM_RE = /^плавающий\s+видеоплеер$|^floating\s+player$/i;
 const FLOATING_ITEM_E2E = 'more-menu-popover_mini-player';
+const CLIP_RE = /\/@([\w.\-]+)\/(video|photo)\/(\d{6,})/;
+
+// The last clip link reported by a right-click. Kept as a fallback for the
+// floating-player row when the visible <video> cannot be resolved (a poster-
+// only feed card, a page that unmounted the player while the menu was open).
+let lastCardHref = { href: '', at: 0 };
+
+/**
+ * The <video> the user is actually watching. This is the same ranking the old
+ * native-PiP implementation used: only elements with visible area, then
+ * playing, then visible area, then distance from the viewport centre. It returns
+ * null when nothing is on screen, so the caller never floats a prefetch tag.
+ */
+function pickVisibleVideo() {
+  const cx = window.innerWidth / 2;
+  const cy = window.innerHeight / 2;
+  const scored = [];
+  for (const v of document.querySelectorAll('video')) {
+    const r = v.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) continue;
+    const visH = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
+    const visW = Math.max(0, Math.min(r.right, window.innerWidth) - Math.max(r.left, 0));
+    const area = visH * visW;
+    if (area <= 0) continue;
+    const mx = r.left + r.width / 2;
+    const my = r.top + r.height / 2;
+    scored.push({
+      v,
+      area,
+      playing: !v.paused && !v.ended && v.readyState > 2,
+      centerDist: Math.hypot(mx - cx, my - cy),
+    });
+  }
+  scored.sort((a, b) => {
+    if (a.playing !== b.playing) return a.playing ? -1 : 1;
+    if (a.area !== b.area) return b.area - a.area;
+    return a.centerDist - b.centerDist;
+  });
+  return scored.length ? scored[0].v : null;
+}
+
+/**
+ * The clip link of the card that owns this exact <video>. Direct wrapper anchor
+ * first; otherwise the nearest ancestor that contains only THIS video, so a
+ * shared feed container can never hand back a neighbour's link.
+ */
+function hrefOf(video) {
+  if (!video) return '';
+  try {
+    const direct = video.closest && video.closest('a[href*="/video/"], a[href*="/photo/"]');
+    if (direct) return direct.href || direct.getAttribute('href') || '';
+    let el = video;
+    for (let i = 0; i < 12 && el && el !== document.body; i += 1, el = el.parentElement) {
+      if (!el.querySelectorAll) continue;
+      if (el.querySelectorAll('video').length !== 1) break;
+      const a = el.querySelector('a[href*="/video/"], a[href*="/photo/"]');
+      if (a) return a.href || a.getAttribute('href') || '';
+    }
+  } catch (_) {}
+  return '';
+}
 
 function install() {
   // Guard on the document, not on window: TikTok's SPA swaps the document on
@@ -80,6 +141,9 @@ function install() {
       // main paints nothing on it.
       event.preventDefault();
       const info = describe(event.target, event);
+      if (info.linkURL && CLIP_RE.test(info.linkURL)) {
+        lastCardHref = { href: info.linkURL, at: Date.now() };
+      }
       ipcRenderer.send('feed:guestMenu', info);
     },
     true
@@ -120,6 +184,11 @@ function install() {
   // The row is always intercepted. Letting the click through would either hit
   // TikTok's no-op or close a player the user cannot see; main.js instead opens
   // the app window or reports why it cannot (no clip on screen).
+  //
+  // The click carries the card's own href, resolved from the visible <video>
+  // at click time — the same element the old native-PiP path floated. Without
+  // it main.js had to guess the clip again after an async round-trip, and the
+  // feed could already have moved on.
   document.addEventListener(
     'click',
     (event) => {
@@ -130,7 +199,23 @@ function install() {
       if (!row && !FLOATING_ITEM_RE.test(text)) return;
       event.preventDefault();
       event.stopImmediatePropagation();
-      ipcRenderer.send('feed:float');
+
+      const video = pickVisibleVideo();
+      let href = hrefOf(video);
+      if (!href && lastCardHref.href && Date.now() - lastCardHref.at < 60000) {
+        href = lastCardHref.href;
+      }
+      let rect = null;
+      try {
+        rect = video ? video.getBoundingClientRect() : null;
+      } catch (_) {}
+      ipcRenderer.send('feed:float', {
+        href,
+        id: (String(href).match(CLIP_RE) || [])[3] || '',
+        point: Boolean(video),
+        x: rect ? Math.round(rect.left + rect.width / 2) : 0,
+        y: rect ? Math.round(rect.top + rect.height / 2) : 0,
+      });
     },
     true
   );

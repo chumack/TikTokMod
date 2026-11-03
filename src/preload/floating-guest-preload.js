@@ -48,6 +48,12 @@ let booted = false;
 let isolateQueued = false;
 let lastHref = '';
 let playButton = null;
+// The clip the host asked this document to show. TikTok serves "video
+// unavailable" and region-blocked pages that still render a <video> from the
+// recommendation column; without this gate that video was painted and the host
+// played a stranger's clip under its controls.
+let wantedId = '';
+let wrongPageSent = false;
 
 function send(channel, payload) {
   try {
@@ -85,6 +91,35 @@ function force(el, prop, value) {
 function currentId() {
   const m = String(location.pathname || '').match(/\/(?:video|photo)\/(\d{6,})/);
   return m ? m[1] : '';
+}
+
+/**
+ * True when this document is not the clip the host asked for. An empty
+ * wantedId means the host has not spoken yet (first paint of the first clip),
+ * so nothing is enforced.
+ */
+function wrongDocument() {
+  return Boolean(wantedId && currentId() && currentId() !== wantedId);
+}
+
+/**
+ * Refuses to treat this page as the requested clip: stops the video, puts back
+ * every hidden ancestor and tells the host exactly once. The host retries the
+ * same clip once and then advances; answering repeatedly would make it fight
+ * its own navigation.
+ */
+function refusePage() {
+  if (video) {
+    releaseVideo(video);
+    restoreHidden();
+    video = null;
+  }
+  endedSent = false;
+  readySent = false;
+  hidePlayButton();
+  if (wrongPageSent) return;
+  wrongPageSent = true;
+  send('floating:wrongPage', { href: location.href, id: currentId(), wanted: wantedId });
 }
 
 /**
@@ -354,6 +389,10 @@ function sendMeta() {
 
 function markReady() {
   if (!video || readySent) return;
+  if (wrongDocument()) {
+    refusePage();
+    return;
+  }
   readySent = true;
   send('floating:ready', { href: location.href, id: currentId() });
   sendMeta();
@@ -364,6 +403,10 @@ function markReady() {
 
 function markError() {
   if (video || errorSent) return;
+  if (wrongDocument()) {
+    refusePage();
+    return;
+  }
   errorSent = true;
   send('floating:error', { href: location.href, reason: 'no-video' });
 }
@@ -380,6 +423,10 @@ function scheduleIsolate(delay) {
 }
 
 function isolate() {
+  if (wrongDocument()) {
+    refusePage();
+    return;
+  }
   const v = pickVideo();
   if (!v) return;
 
@@ -459,8 +506,8 @@ function seekBy(delta) {
 function watchLocation() {
   if (location.href === lastHref) return;
   lastHref = location.href;
-  // A same-document navigation swapped the clip. Treat it as a fresh page so a
-  // stale ended flag cannot swallow the new video's end.
+  // A same-document navigation swapped the clip. wantedId survives it: a
+  // redirect to another clip must not be adopted as the requested one.
   releaseVideo(video);
   restoreHidden();
   video = null;
@@ -469,6 +516,11 @@ function watchLocation() {
   errorSent = false;
   wantPlaying = true;
   hidePlayButton();
+  if (wrongDocument()) {
+    refusePage();
+    return;
+  }
+  wrongPageSent = false;
   scheduleIsolate(0);
 }
 
@@ -632,6 +684,23 @@ function boot() {
 // new clip frozen until the user pressed something.
 function onCommand(_event, cmd) {
   if (!cmd || typeof cmd !== 'object') return;
+  if (cmd.type === 'want') {
+    const id = String(cmd.id || '');
+    wantedId = id;
+    wrongPageSent = false;
+    readySent = false;
+    errorSent = false;
+    endedSent = false;
+    // This preload survives a navigation. If the document already belongs to a
+    // different clip (a redirect), refuse it now instead of waiting for paint.
+    if (id && currentId() && currentId() !== id) {
+      refusePage();
+      return;
+    }
+    if (video) markReady();
+    else scheduleIsolate(0);
+    return;
+  }
   if (cmd.type === 'play') {
     wantPlaying = true;
     safePlay(video);
@@ -664,6 +733,10 @@ function onCommand(_event, cmd) {
 }
 
 function onPing() {
+  if (wrongDocument()) {
+    refusePage();
+    return;
+  }
   if (video) markReady();
   else scheduleIsolate(0);
 }
