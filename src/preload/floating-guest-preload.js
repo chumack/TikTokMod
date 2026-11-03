@@ -97,9 +97,13 @@ function currentId() {
  * True when this document is not the clip the host asked for. An empty
  * wantedId means the host has not spoken yet (first paint of the first clip),
  * so nothing is enforced.
+ *
+ * A document with NO clip id in its path is a mismatch too: a redirect to
+ * /foryou, /login or an "account not found" page still renders feed videos, and
+ * the old code treated "I cannot tell" as "probably fine" and painted one.
  */
 function wrongDocument() {
-  return Boolean(wantedId && currentId() && currentId() !== wantedId);
+  return Boolean(wantedId && currentId() !== wantedId);
 }
 
 /**
