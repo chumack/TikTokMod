@@ -208,8 +208,8 @@ const COLLECT_SCRIPT = `(() => {
  * scrolling the window.
  *
  * It also remembers which element and which offset it moved, so collect() can
- * put the tab back where the user left it. Growing the floating queue must not
- * scroll the feed away under the user.
+ * put the tab back where the user left it. «Загрузить ещё» must not scroll the
+ * feed away under the user.
  */
 const SCROLL_SCRIPT = `(() => {
   const A_RE = 'a[href*="/video/"], a[href*="/photo/"]';
@@ -279,9 +279,8 @@ const SCROLL_SCRIPT = `(() => {
 })()`;
 
 /**
- * Puts the feed back where SCROLL_SCRIPT found it. Without this, "extend the
- * floating queue" would scroll the tab the user is about to return to, so the
- * clip they were watching would no longer be on screen.
+ * Puts the feed back where SCROLL_SCRIPT found it. Without this, «Загрузить ещё»
+ * would scroll the tab away from the clip the user was watching.
  */
 const RESTORE_SCROLL_SCRIPT = `(() => {
   const el = window.__tkmScrollEl;
@@ -377,8 +376,8 @@ const PLAYING_SCRIPT = `(() => {
       }
       // An anchor is only trustworthy while the chain still belongs to ONE
       // card. On a shared feed container querySelector returns the first anchor
-      // in document order — a different clip — which is how the floating player
-      // used to open the wrong video.
+      // in document order — a different clip — which is how the wrong video
+      // used to be picked.
       const self = el.matches && el.matches('a[href*="/video/"], a[href*="/photo/"]') ? el : null;
       if (self && take(self.getAttribute('href'))) break;
       const alone = el.querySelectorAll && el.querySelectorAll('video').length === 1;
@@ -753,9 +752,8 @@ function waitForDomReady(wc, timeout = 8000) {
  * Collects the videos rendered in the browser tab, merging with what was
  * already gathered so repeated clicks grow the list instead of replacing it.
  *
- * `scroll` makes TikTok render the next batch. `restore` (used by the floating
- * player) puts the tab back where it was first: growing the queue must not move
- * the clip the user is watching.
+ * `scroll` makes TikTok render the next batch. `restore` puts the tab back where
+ * it was first: «Загрузить ещё» must not move the clip the user is watching.
  */
 async function collect({ scroll = false, restore = false, previous = [] } = {}) {
   await installHooks();
@@ -1067,7 +1065,7 @@ function videoFromCurrent(v) {
  * ranks by visible area and resolves the anchor of THAT element. PLAYING_SCRIPT
  * is only a fallback for pages where CURRENT_SCRIPT finds no <video> at all —
  * it used to be the primary and could return an off-screen or neighbouring
- * card, which is exactly how the floating player opened a different clip.
+ * card, which is exactly how the wrong clip used to be picked.
  */
 async function currentPlaying() {
   const cur = await currentVideo();
@@ -1087,64 +1085,6 @@ async function currentPlaying() {
     };
   }
   return { ok: true, video: v };
-}
-
-/**
- * Pauses whatever the built-in browser is playing, and remembers it, so the
- * floating player can own the speakers while it is open.
- *
- * The marker is an attribute rather than a JS variable on purpose: `runInGuest`
- * executes a fresh script every time, and an element reference cannot survive
- * between calls. The attribute also survives a TikTok re-render of the
- * surrounding card, which is why it is not a WeakSet either.
- *
- * Only <video> elements that are actually playing and have real area are
- * paused. TikTok keeps zero-sized prefetch tags around, and marking those
- * would make resumeAfterFloating() start a hidden clip later.
- */
-const FLOAT_PAUSE_SCRIPT = `(() => {
-  let n = 0;
-  for (const v of document.querySelectorAll('video')) {
-    if (v.paused || v.ended) continue;
-    const r = v.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) continue;
-    v.setAttribute('data-tkm-float-paused', '1');
-    try { v.pause(); } catch (_) {}
-    n += 1;
-  }
-  return n;
-})()`;
-
-/**
- * Resumes exactly the clips pauseForFloating() stopped. A clip that TikTok has
- * already moved away from is gone with the attribute, so nothing else starts.
- */
-const FLOAT_RESUME_SCRIPT = `(() => {
-  let n = 0;
-  for (const v of document.querySelectorAll('video[data-tkm-float-paused]')) {
-    v.removeAttribute('data-tkm-float-paused');
-    // The user may have scrolled the tab while the player was open. A marked
-    // clip that is no longer on screen must not start playing next to whatever
-    // TikTok shows now.
-    const r = v.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) continue;
-    try {
-      const p = v.play();
-      if (p && p.catch) p.catch(() => {});
-      n += 1;
-    } catch (_) {}
-  }
-  return n;
-})()`;
-
-async function pauseForFloating() {
-  const res = await runInGuest(FLOAT_PAUSE_SCRIPT);
-  return res.ok ? Number(res.value) || 0 : 0;
-}
-
-async function resumeAfterFloating() {
-  const res = await runInGuest(FLOAT_RESUME_SCRIPT);
-  return res.ok ? Number(res.value) || 0 : 0;
 }
 
 /**
@@ -1212,8 +1152,6 @@ module.exports = {
   currentVideo,
   currentPlaying,
   videoFromCurrent,
-  pauseForFloating,
-  resumeAfterFloating,
   detectLive,
   installHooks,
   runInGuest,

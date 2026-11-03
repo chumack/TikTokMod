@@ -14,7 +14,6 @@ const geobypass = require('./geobypass');
 const ttapi = require('./ttapi');
 const signer = require('./signer');
 const feed = require('./feed');
-const floating = require('./floating');
 const live = require('./live');
 const livechat = require('./livechat');
 
@@ -27,13 +26,6 @@ let win = null;
 // browser is not open" while the webview is plainly on screen.
 let feedGuestId = null;
 const ALLOWED_HOSTS = /(^|\.)(tiktok\.com|musical\.ly|tiktokcdn\.com|tiktokcdn-us\.com|tiktokv\.com|amemv\.com|byteoversea\.com|tiktokmusic\.com)$/i;
-
-// The floating player opens a second TikTok page from a click in a different
-// window. Chromium's default autoplay policy keys on user activation per
-// document, so that page would sit on a frozen first frame until the user
-// clicked it. The app is a TikTok browser whose feed already plays by itself;
-// allow media playback process-wide.
-app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
 // Counts every download the session handler cancelled. Exported so the
 // selftest can tell "the event never fired" from "it fired but nothing was
@@ -78,10 +70,8 @@ function createWindow() {
 
   // The hidden audio-capture window must never outlive the main one: it is a
   // BrowserWindow like any other, so leaving it open would stop `window-all-closed`
-  // from ever firing and the app would survive with nothing on screen. The same
-  // applies to the floating player, which is also a real window.
+  // from ever firing and the app would survive with nothing on screen.
   win.on('closed', () => {
-    floating.close();
     destroyGuestAudioWindow();
   });
 
@@ -678,10 +668,6 @@ app.whenReady().then(async () => {
   migrateSettings();
   ensureEmulatorPersisted();
   Menu.setApplicationMenu(buildMenu());
-  // The floating player's IPC has to exist before its window can be opened; the
-  // callback is how it reaches the current main window (createWindow may run
-  // more than once on macOS).
-  floating.install({ getMain: () => win });
   createWindow();
   // Screen mode takes its sound from the guest's own audio track (see the
   // guest-audio block above). Registered once, here, because the handler has to
@@ -1397,108 +1383,6 @@ ipcMain.on('feed:downloadCurrent', async () => {
   });
 });
 
-// "Плавающий видеоплеер" from TikTok's own menu. The click is intercepted by
-// src/preload/webview-preload.js and routed here; there is no native PiP in
-// this path any more (see the note there).
-//
-// The click handler sends the href of the card the user opened the menu on
-// (resolved from the visible <video>, like the old PiP path did). That id is
-// the first clip of the queue — this is what keeps the player on the clip the
-// user clicked instead of whatever a DOM heuristic guessed a moment later.
-// The queue itself is the feed in visual order (see feed.js COLLECT_SCRIPT).
-let floatingToggleBusy = false;
-let lastGuestMenu = { href: '', at: 0 };
-
-/**
- * Parses a TikTok clip link into the queue's item shape. Anything that is not
- * an absolute tiktok.com /@handle/(video|photo)/<id> URL is rejected: the page
- * can send arbitrary text over IPC, so it is not trusted as a URL.
- */
-function clipFromHref(href) {
-  try {
-    const u = new URL(String(href || ''));
-    if (!/(^|\.)tiktok\.com$/i.test(u.hostname)) return null;
-    const m = u.pathname.match(/^\/@([\w.\-]+)\/(video|photo)\/(\d{6,})\/?$/);
-    if (!m) return null;
-    return {
-      id: m[3],
-      handle: m[1],
-      isPhoto: m[2] === 'photo',
-      url: 'https://www.tiktok.com/@' + m[1] + '/' + m[2] + '/' + m[3],
-    };
-  } catch (_) {
-    return null;
-  }
-}
-
-function floatNotice(message) {
-  if (!win || win.isDestroyed()) return;
-  win.webContents.send('feed:menuAction', { action: 'notice', message });
-}
-
-ipcMain.on('feed:float', async (_event, ctx) => {
-  if (floatingToggleBusy) return;
-  floatingToggleBusy = true;
-  try {
-    // The same menu row closes an open player. Doing it here, rather than in
-    // the guest preload, keeps the toggle state in one process.
-    if (floating.isOpen()) {
-      floating.close();
-      return;
-    }
-
-    // 1. The card under the click. 2. The last card TikTok's own context menu
-    // reported (a right-click followed by the menu row). 3. The on-screen clip
-    // at the click coordinates. 4. currentPlaying().
-    let target = clipFromHref(ctx && ctx.href);
-    if (!target && lastGuestMenu.href && Date.now() - lastGuestMenu.at < 30000) {
-      target = clipFromHref(lastGuestMenu.href);
-    }
-
-    let video = null;
-    if (target) {
-      if (target.isPhoto) {
-        floatNotice('Это фото-пост — плавающий плеер воспроизводит только видео.');
-        return;
-      }
-      video = target;
-    } else if (ctx && ctx.point === true) {
-      const at = await feed.currentVideo(Number(ctx.x) || 0, Number(ctx.y) || 0);
-      if (at && at.ok && at.video) video = feed.videoFromCurrent(at.video);
-    }
-
-    if (!video) {
-      const current = await feed.currentPlaying();
-      if (!current || !current.ok || !current.video || !current.video.url) {
-        floatNotice(
-          (current && current.error) ||
-            'Не удалось определить ролик на экране. Дождитесь, пока видео начнёт играть, и попробуйте снова.'
-        );
-        return;
-      }
-      if (current.video.isPhoto) {
-        floatNotice('Это фото-пост — плавающий плеер воспроизводит только видео.');
-        return;
-      }
-      video = current.video;
-    }
-
-    const collected = await feed.collect({ previous: [] });
-    const built = floating.buildPlaylist(
-      video,
-      collected && collected.ok ? collected.items : []
-    );
-    if (!built.items.length) {
-      floatNotice('Не удалось открыть этот ролик: не нашлась его ссылка в ленте.');
-      return;
-    }
-    const res = await floating.open({ playlist: built.items, index: built.index });
-    if (!res.ok) floatNotice(res.error || 'Не удалось открыть плавающий плеер.');
-  } finally {
-    floatingToggleBusy = false;
-  }
-});
-
 // Absolute file:// URL for the <webview> preload. The renderer cannot build it
 // itself: it has no filesystem access and the packaged path differs from the
 // repo one.
@@ -1509,18 +1393,13 @@ ipcMain.handle('feed:guestPreloadUrl', () => {
 
 // Right-click reported from inside the guest (see src/preload/webview-preload.js).
 //
-// The app paints no menu on a right-click, but the report carries the link under
-// the cursor. It is kept as a fallback for the "Плавающий видеоплеер" row: if
-// the click handler cannot resolve the visible card, this is the last card the
-// user pointed at. localPopupCheck() also listens on this channel to prove the
-// guest preload is attached.
-ipcMain.on('feed:guestMenu', (event, info) => {
-  if (!info || typeof info.linkURL !== 'string') return;
-  if (feedGuestId && event && event.sender && event.sender.id !== feedGuestId) return;
-  if (/\/@[\w.\-]+\/(?:video|photo)\/\d{6,}/.test(info.linkURL)) {
-    lastGuestMenu = { href: info.linkURL, at: Date.now() };
-  }
-});
+// Diagnostics only. The app paints no menu on a right-click, so there is
+// nothing to decide here and nothing to send back — the handler is deliberately
+// empty. The channel is kept because runSelfTest()'s localPopupCheck() listens
+// on it to prove the guest preload is attached, and an unattached preload is
+// otherwise invisible: «Загрузить видео» still "works" through the will-download
+// cancellation in createWindow(), so it can never be used as proof.
+ipcMain.on('feed:guestMenu', () => {});
 
 // ---------- LIVE recording ----------
 
