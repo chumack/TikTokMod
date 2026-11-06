@@ -65,37 +65,365 @@ const FLOATING_ITEM_RE = /^плавающий\s+видеоплеер$|^floating\
 const FLOATING_ITEM_E2E = 'more-menu-popover_mini-player';
 
 /**
- * The <video> the user is actually watching. This is the same ranking the old
- * native-PiP implementation used: only elements with visible area, then
- * playing, then visible area, then distance from the viewport centre. It returns
- * null when nothing is on screen, so the caller never floats a prefetch tag.
+ * The clip id the open "..." menu belongs to, or ''.
+ *
+ * The menu is rendered in a body-level portal outside the card, so the id is
+ * read from (in order): an ancestor carrying data-more-menu-item-id, the
+ * expanded trigger button, or the trigger whose card contains the centre of the
+ * viewport. The id is TikTok's own video id; pickVisibleVideo() resolves it
+ * through the #xgwrapper-0-<id> player wrapper.
  */
-function pickVisibleVideo() {
-  const cx = window.innerWidth / 2;
-  const cy = window.innerHeight / 2;
-  const scored = [];
-  for (const v of document.querySelectorAll('video')) {
-    const r = v.getBoundingClientRect();
-    if (r.width <= 0 || r.height <= 0) continue;
-    const visH = Math.max(0, Math.min(r.bottom, window.innerHeight) - Math.max(r.top, 0));
-    const visW = Math.max(0, Math.min(r.right, window.innerWidth) - Math.max(r.left, 0));
-    const area = visH * visW;
-    if (area <= 0) continue;
-    const mx = r.left + r.width / 2;
-    const my = r.top + r.height / 2;
-    scored.push({
+function menuItemVideoId(target) {
+  try {
+    const holder = target.closest && target.closest('[data-more-menu-item-id]');
+    if (holder) {
+      const id = holder.getAttribute('data-more-menu-item-id');
+      if (id) return id;
+    }
+  } catch (_) {}
+
+  try {
+    const open = document.querySelector(
+      '[data-e2e="more-menu-icon"][aria-expanded="true"][data-more-menu-item-id]'
+    );
+    if (open) {
+      const id = open.getAttribute('data-more-menu-item-id');
+      if (id) return id;
+    }
+  } catch (_) {}
+
+  // TikTok has been seen without aria-expanded on the trigger. The menu is
+  // opened on the card in the middle of the window, so take that card's id.
+  let best = '';
+  let bestDist = Infinity;
+  try {
+    const cx = window.innerWidth / 2;
+    const cy = window.innerHeight / 2;
+    const buttons = document.querySelectorAll(
+      'button[data-e2e="more-menu-icon"][data-more-menu-item-id]'
+    );
+    for (let i = 0; i < buttons.length; i += 1) {
+      const b = buttons[i];
+      let card = null;
+      try {
+        card = b.closest('article, section[data-e2e="feed-video"]');
+      } catch (_) {
+        card = null;
+      }
+      if (!card) continue;
+      const r = card.getBoundingClientRect();
+      if (cx < r.left || cx > r.right || cy < r.top || cy > r.bottom) continue;
+      const dx = (r.left + r.right) / 2 - cx;
+      const dy = (r.top + r.bottom) / 2 - cy;
+      const d = Math.hypot(dx, dy);
+      if (d < bestDist) {
+        bestDist = d;
+        best = b.getAttribute('data-more-menu-item-id') || '';
+      }
+    }
+  } catch (_) {}
+  return best;
+}
+
+/**
+ * The <video> the user is actually watching, or null when there is nothing
+ * floatable on screen.
+ *
+ * Why the old ranking (playing -> area -> centre distance) is wrong for the
+ * feed: "playing" says nothing about what is painted on top. TikTok keeps
+ * several <video> tags in the DOM (the previous card, the next card, prefetch
+ * tags, a hidden background player); a hidden one can be playing and can have a
+ * larger rect than the visible card. A paused card can be the one on display.
+ * Area is equally misleading: stacked feed cards have identical rects.
+ *
+ * preferredId is the clip id read from the "..." menu that opened the click
+ * (button[data-e2e="more-menu-icon"][data-more-menu-item-id]). It is the only
+ * exact signal: TikTok wraps each card's player in #xgwrapper-0-<id>, so the
+ * clip the menu belongs to can be named, not guessed. Note the menu lives in a
+ * body-level portal, outside the card, so the id has to travel through the
+ * click target or the menu button.
+ *
+ * With no id, Chromium's own paint order at the centre of each candidate is
+ * used: elementsFromPoint() returns the whole hit-test stack, top first.
+ * Overlay nodes (subtitles, the open "more" menu) are skipped by climbing to
+ * the nearest ancestor that owns exactly ONE visible video; shared ancestors
+ * (the feed container, body) are never allowed to answer, because their first
+ * <video> belongs to another card. Geometry is the fallback.
+ *
+ * Hard filters before ranking:
+ *   - display:none / visibility:hidden anywhere up the tree;
+ *   - visible area (viewport + overflow-clipping ancestors) of at least 0.5%
+ *     of the viewport, so a 1px sliver of a prefetch tag cannot win;
+ *   - disablePictureInPicture: if the clip the user sees forbids PiP, return
+ *     null instead of floating a different clip just because that one allows it.
+ *
+ * Effective opacity is a ranking demotion, not a hard cut: a headless TikTok
+ * run reported opacity 0 on the clip whose frame was plainly painted, so when
+ * every candidate reports zero the signal is ignored rather than losing PiP
+ * altogether.
+ *
+ * "playing" is deliberately not part of the ranking at all. Paused is a normal
+ * state of the clip the user is looking at; playing is not evidence of being
+ * visible. readyState is checked only at the very end, so an unready top card
+ * blocks the clips underneath instead of silently handing PiP to another card.
+ */
+function pickVisibleVideo(preferredId) {
+  const win = window;
+  const doc = win.document;
+  const vw = win.innerWidth || 0;
+  const vh = win.innerHeight || 0;
+  if (!doc || vw <= 0 || vh <= 0) return null;
+
+  const MIN_AREA = Math.max(400, vw * vh * 0.005); // 0.5% of the viewport
+
+  const styleOf = (el) => {
+    try {
+      return win.getComputedStyle ? win.getComputedStyle(el) : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  // Effective visibility of the whole ancestor chain, not just the element:
+  // a video inside a visibility:hidden wrapper is not visible even though its
+  // own computed style says "visible". Opacity is reported separately.
+  const styleInfo = (el) => {
+    let opacity = 1;
+    let n = el;
+    for (let i = 0; i < 40 && n && n.nodeType === 1; i += 1, n = n.parentElement) {
+      const cs = styleOf(n);
+      if (!cs) continue;
+      if (cs.display === 'none') return { hidden: true, opacity: 0 };
+      if (cs.visibility === 'hidden' || cs.visibility === 'collapse') return { hidden: true, opacity: 0 };
+      const o = Number.parseFloat(cs.opacity);
+      if (Number.isFinite(o)) opacity *= o;
+    }
+    return { hidden: false, opacity };
+  };
+
+  // Viewport intersection further clipped by ancestor overflow boxes. The feed
+  // scroll box and cards with overflow:hidden are exactly the ancestors that
+  // matter; body/html are handled by the viewport intersection itself.
+  const visibleRect = (el) => {
+    let r;
+    try {
+      r = el.getBoundingClientRect();
+    } catch (_) {
+      return null;
+    }
+    if (!r || !(r.width > 0) || !(r.height > 0)) return null;
+
+    let left = Math.max(0, r.left);
+    let top = Math.max(0, r.top);
+    let right = Math.min(vw, r.right);
+    let bottom = Math.min(vh, r.bottom);
+
+    let n = el.parentElement;
+    for (
+      let i = 0;
+      i < 40 && n && n.nodeType === 1 && n !== doc.body && n !== doc.documentElement;
+      i += 1, n = n.parentElement
+    ) {
+      const cs = styleOf(n);
+      if (!cs) continue;
+      if (cs.display === 'none') return null;
+      if (cs.visibility === 'hidden' || cs.visibility === 'collapse') return null;
+      const ox = cs.overflowX || cs.overflow;
+      const oy = cs.overflowY || cs.overflow;
+      if ((ox && ox !== 'visible') || (oy && oy !== 'visible')) {
+        let ar;
+        try {
+          ar = n.getBoundingClientRect();
+        } catch (_) {
+          ar = null;
+        }
+        if (ar) {
+          left = Math.max(left, ar.left);
+          top = Math.max(top, ar.top);
+          right = Math.min(right, ar.right);
+          bottom = Math.min(bottom, ar.bottom);
+        }
+      }
+    }
+
+    const width = right - left;
+    const height = bottom - top;
+    if (!(width > 0) || !(height > 0)) return null;
+    return { left, top, right, bottom, width, height, area: width * height };
+  };
+
+  const visibleCache = new WeakMap();
+  const visibleRectOf = (v) => {
+    if (!v || v.tagName !== 'VIDEO' || v.isConnected === false) return null;
+    if (visibleCache.has(v)) return visibleCache.get(v);
+    let r = null;
+    if (!styleInfo(v).hidden) {
+      r = visibleRect(v);
+      if (r && r.area < MIN_AREA) r = null;
+    }
+    visibleCache.set(v, r);
+    return r;
+  };
+
+  const finish = (v) => {
+    if (!v || v.isConnected === false) return null;
+    // The visible clip cannot be floated: decline. Do not fall through to a
+    // neighbour card, that would be the original bug in a new form.
+    if (v.disablePictureInPicture) return null;
+    if (v.error) return null;
+    if (!(v.readyState > 0)) return null;
+    return v;
+  };
+
+  // Exact clip named by the menu. TikTok's player wrapper is
+  // #xgwrapper-0-<videoId>, the same id the "..." button carries in
+  // data-more-menu-item-id. Older markup may lack the wrapper id, in which case
+  // the trigger with this id is climbed to its article/section card.
+  const videoForId = (id) => {
+    if (!id) return null;
+    const wrapperId = 'xgwrapper-0-' + id;
+    let wrapper = null;
+    try {
+      if (typeof doc.getElementById === 'function') wrapper = doc.getElementById(wrapperId);
+    } catch (_) {}
+    if (!wrapper) {
+      try {
+        const triggers = doc.querySelectorAll(
+          'button[data-e2e="more-menu-icon"][data-more-menu-item-id]'
+        );
+        for (let i = 0; i < triggers.length; i += 1) {
+          const t = triggers[i];
+          if (t.getAttribute('data-more-menu-item-id') !== id) continue;
+          try {
+            wrapper = t.closest('article, section[data-e2e="feed-video"]');
+          } catch (_) {
+            wrapper = null;
+          }
+          if (wrapper) break;
+        }
+      } catch (_) {}
+    }
+    if (!wrapper) return null;
+    if (wrapper.tagName === 'VIDEO') return wrapper;
+    try {
+      return wrapper.querySelector('video');
+    } catch (_) {
+      return null;
+    }
+  };
+
+  if (preferredId) {
+    const exact = videoForId(preferredId);
+    // A resolved clip that cannot float is a deliberate "no" — never a
+    // neighbour. An id that cannot be resolved at all (older markup) falls
+    // through to the geometric path.
+    if (exact) return visibleRectOf(exact) ? finish(exact) : null;
+  }
+
+  const list = doc.querySelectorAll('video');
+  const candidates = [];
+  for (let i = 0; i < list.length; i += 1) {
+    const v = list[i];
+    const r = visibleRectOf(v);
+    if (!r) continue;
+    const cx = vw / 2;
+    const cy = vh / 2;
+    const covers = cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom;
+    const dx = r.left + r.width / 2 - cx;
+    const dy = r.top + r.height / 2 - cy;
+    candidates.push({
       v,
-      area,
-      playing: !v.paused && !v.ended && v.readyState > 2,
-      centerDist: Math.hypot(mx - cx, my - cy),
+      r,
+      covers,
+      dist: covers ? 0 : Math.hypot(dx, dy),
+      index: i,
+      transparent: styleInfo(v).opacity <= 0.01,
     });
   }
-  scored.sort((a, b) => {
-    if (a.playing !== b.playing) return a.playing ? -1 : 1;
-    if (a.area !== b.area) return b.area - a.area;
-    return a.centerDist - b.centerDist;
+  if (!candidates.length) return null;
+
+  // Headless Chromium sometimes reports opacity:0 on the clip that is plainly
+  // painted (measured on tiktok.com); in that case ignore the signal for the
+  // whole set instead of refusing to float anything.
+  if (candidates.every((c) => c.transparent)) {
+    for (let i = 0; i < candidates.length; i += 1) candidates[i].transparent = false;
+  }
+
+  // The card that covers the middle of the window is the one on display; among
+  // equal cards DOM order is the last key so the result never depends on sort
+  // stability. "playing" is intentionally absent.
+  candidates.sort((a, b) => {
+    if (a.transparent !== b.transparent) return a.transparent ? 1 : -1;
+    if (a.covers !== b.covers) return a.covers ? -1 : 1;
+    if (a.dist !== b.dist) return a.dist - b.dist;
+    if (a.r.area !== b.r.area) return b.r.area - a.r.area;
+    return a.index - b.index;
   });
-  return scored.length ? scored[0].v : null;
+
+  // The node itself, or the nearest ancestor that owns exactly one VISIBLE
+  // video. A shared container with two or more visible videos must not answer:
+  // its first <video> in document order is a different clip.
+  const ownerVideo = (node) => {
+    let el = node;
+    for (let i = 0; i < 16 && el && el.nodeType === 1; i += 1, el = el.parentElement) {
+      if (el.tagName === 'VIDEO') return visibleRectOf(el) ? el : null;
+      if (el === doc.body || el === doc.documentElement) return null;
+      let videos = null;
+      try {
+        videos = el.querySelectorAll ? el.querySelectorAll('video') : null;
+      } catch (_) {
+        videos = null;
+      }
+      if (!videos || !videos.length) continue;
+      let only = null;
+      let count = 0;
+      for (let j = 0; j < videos.length; j += 1) {
+        if (visibleRectOf(videos[j])) {
+          only = videos[j];
+          count += 1;
+        }
+      }
+      if (count === 1) return only;
+      if (count > 1) return null; // ambiguous layer: never guess
+    }
+    return null;
+  };
+
+  const videoAt = (x, y) => {
+    let stack = [];
+    try {
+      if (typeof doc.elementsFromPoint === 'function') {
+        stack = doc.elementsFromPoint(x, y) || [];
+      } else if (typeof doc.elementFromPoint === 'function') {
+        const el = doc.elementFromPoint(x, y);
+        stack = el ? [el] : [];
+      }
+    } catch (_) {
+      stack = [];
+    }
+    for (let i = 0; i < stack.length; i += 1) {
+      const v = ownerVideo(stack[i]);
+      if (v) return v;
+    }
+    return null;
+  };
+
+  const clampX = (x) => Math.max(0, Math.min(vw - 0.5, x));
+  const clampY = (y) => Math.max(0, Math.min(vh - 0.5, y));
+
+  // Probe the centre of each candidate in centrality order. The first one that
+  // is also the topmost visible video at that point wins. A candidate hidden
+  // under another card, or behind a higher card, is rejected by the probe.
+  for (let i = 0; i < candidates.length; i += 1) {
+    const c = candidates[i];
+    const x = clampX(c.r.left + c.r.width / 2);
+    const y = clampY(c.r.top + c.r.height / 2);
+    const top = videoAt(x, y);
+    if (top && top !== c.v) continue;
+    return finish(c.v);
+  }
+
+  return null;
 }
 
 function install() {
@@ -159,9 +487,12 @@ function install() {
   // mini-player with its item list: that part is unrecoverable in Electron.
   //
   // This is deliberately the SAME behaviour the app had before the custom
-  // floating window (6c71608): the click floats the <video> under the cursor,
-  // with no queue and no DOM lookups after the fact, so it cannot open a
-  // different clip.
+  // floating window (6c71608): the click floats one <video> natively, with no
+  // queue and no switching inside the window. The clip is resolved from the id
+  // of the "..." menu's card before the click is cancelled; if that id is not
+  // available, the card covering the centre of the viewport wins. A resolved
+  // clip that cannot float declines the click instead of substituting a
+  // neighbour.
   //
   // When it cannot act — native PiP unavailable, or nothing is on screen to
   // float — the click is deliberately NOT intercepted, so TikTok's own handler
@@ -182,8 +513,9 @@ function install() {
       // stopImmediatePropagation() cannot be undone, so the decision to take the
       // click over from TikTok must be complete by this point.
       const closing = Boolean(document.pictureInPictureElement);
-      const video = closing ? null : pickVisibleVideo();
-      if (!closing && (!video || video.disablePictureInPicture)) return;
+      const clipId = closing ? '' : menuItemVideoId(target);
+      const video = closing ? null : pickVisibleVideo(clipId);
+      if (!closing && (!video || video.disablePictureInPicture || video.isConnected === false)) return;
 
       event.preventDefault();
       event.stopImmediatePropagation();
