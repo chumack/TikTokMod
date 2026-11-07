@@ -64,46 +64,137 @@ const DOWNLOAD_ITEM_RE = /^загрузить\s+видео$/i;
 const FLOATING_ITEM_RE = /^плавающий\s+видеоплеер$|^floating\s+player$/i;
 const FLOATING_ITEM_E2E = 'more-menu-popover_mini-player';
 
+// TikTok clip ids are numeric (e.g. 7701697613590072597). A
+// data-more-menu-item-id that does not look like one names a menu row, not a
+// clip, and must never be resolved as a #xgwrapper-0-<id> key.
+const VIDEO_ID_RE = /^\d{6,}$/;
+
+// The "..." trigger the user actually pressed, remembered in the capture phase.
+// The open menu is a body-level portal that carries no clip id, and TikTok
+// leaves aria-expanded="true" on triggers of previously opened menus. Asking
+// for "the expanded trigger" can therefore name an older card; the button that
+// opened this menu cannot.
+let lastMenuTrigger = null;
+
+function rectOf(el) {
+  try {
+    const r = el && el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+    if (!r || !(r.width > 0) || !(r.height > 0)) return null;
+    return {
+      left: r.left,
+      top: r.top,
+      width: r.width,
+      height: r.height,
+      right: r.left + r.width,
+      bottom: r.top + r.height,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function rectDistance(a, b) {
+  if (!a || !b) return Infinity;
+  return Math.hypot(
+    a.left + a.width / 2 - (b.left + b.width / 2),
+    a.top + a.height / 2 - (b.top + b.height / 2)
+  );
+}
+
+function rememberMenuTrigger(el) {
+  try {
+    const id = el.getAttribute('data-more-menu-item-id') || '';
+    if (!VIDEO_ID_RE.test(id)) return;
+    lastMenuTrigger = { id, el, at: Date.now() };
+  } catch (_) {}
+}
+
 /**
- * The clip id the open "..." menu belongs to, or ''.
+ * Clip ids the open "..." menu may belong to, most exact first.
  *
- * The menu is rendered in a body-level portal outside the card, so the id is
- * read from (in order): an ancestor carrying data-more-menu-item-id, the
- * expanded trigger button, or the trigger whose card contains the centre of the
- * viewport. The id is TikTok's own video id; pickVisibleVideo() resolves it
- * through the #xgwrapper-0-<id> player wrapper.
+ * The menu is rendered in a body-level portal outside the card, so nothing
+ * inside it names the clip unless TikTok itself put data-more-menu-item-id on
+ * the row. The signals, in order:
+ *
+ *   1. the "..." trigger the user pressed (remembered on pointerdown/click);
+ *   2. a numeric data-more-menu-item-id on the row or a portal ancestor;
+ *   3. the trigger nearest the menu row: the menu is anchored to the trigger
+ *      that opened it, so the nearest "..." is its owner even when
+ *      aria-expanded is missing or stale;
+ *   4. the trigger on the card covering the centre of the viewport.
+ *
+ * Only ONE trigger is taken from step 3. Offering its neighbours as fallbacks
+ * would bring the original bug back: an id that cannot be resolved would float
+ * the next card.
  */
-function menuItemVideoId(target) {
+function menuItemVideoIds(target) {
+  const ids = [];
+  const seen = Object.create(null);
+  const add = (value) => {
+    if (typeof value !== 'string') return;
+    const id = value.trim();
+    if (!VIDEO_ID_RE.test(id) || seen[id]) return;
+    seen[id] = true;
+    ids.push(id);
+  };
+
+  const row = rectOf(target);
+
+  // The user pressed this "..." moments before the menu row was clicked. A
+  // remembered id older than a couple of minutes is not trusted: menus do not
+  // stay open that long, so it must belong to an earlier one.
+  if (lastMenuTrigger && Date.now() - lastMenuTrigger.at < 2 * 60 * 1000) {
+    add(lastMenuTrigger.id);
+  }
+
+  // Newer markup may put the clip id on the row or on the portal around it.
   try {
-    const holder = target.closest && target.closest('[data-more-menu-item-id]');
-    if (holder) {
-      const id = holder.getAttribute('data-more-menu-item-id');
-      if (id) return id;
+    let el = target;
+    for (let i = 0; i < 8 && el && el.nodeType === 1; i += 1, el = el.parentElement) {
+      if (el.getAttribute) add(el.getAttribute('data-more-menu-item-id'));
     }
   } catch (_) {}
 
+  let triggers = [];
   try {
-    const open = document.querySelector(
-      '[data-e2e="more-menu-icon"][aria-expanded="true"][data-more-menu-item-id]'
+    triggers = Array.prototype.slice.call(
+      document.querySelectorAll('[data-e2e="more-menu-icon"][data-more-menu-item-id]')
     );
-    if (open) {
-      const id = open.getAttribute('data-more-menu-item-id');
-      if (id) return id;
-    }
-  } catch (_) {}
+  } catch (_) {
+    triggers = [];
+  }
 
-  // TikTok has been seen without aria-expanded on the trigger. The menu is
-  // opened on the card in the middle of the window, so take that card's id.
+  // Nearest trigger by the menu row's position. Without a usable row rect this
+  // signal is skipped: "nearest" would then be arbitrary.
+  let nearest = null;
+  let nearestDist = Infinity;
+  for (let i = 0; i < triggers.length; i += 1) {
+    const d = rectDistance(row, rectOf(triggers[i]));
+    if (d < nearestDist) {
+      nearestDist = d;
+      nearest = triggers[i];
+    }
+  }
+  if (nearest && Number.isFinite(nearestDist)) {
+    add(nearest.getAttribute('data-more-menu-item-id'));
+  }
+
+  // display:contents can give the row no box of its own. Exactly one expanded
+  // trigger is still a usable structural signal then; never guess among
+  // several, because that is the stale-button case.
+  if (!row) {
+    const expanded = triggers.filter((t) => t.getAttribute('aria-expanded') === 'true');
+    if (expanded.length === 1) add(expanded[0].getAttribute('data-more-menu-item-id'));
+  }
+
+  // Last structural resort: the card in the middle of the window.
   let best = '';
   let bestDist = Infinity;
   try {
     const cx = window.innerWidth / 2;
     const cy = window.innerHeight / 2;
-    const buttons = document.querySelectorAll(
-      'button[data-e2e="more-menu-icon"][data-more-menu-item-id]'
-    );
-    for (let i = 0; i < buttons.length; i += 1) {
-      const b = buttons[i];
+    for (let i = 0; i < triggers.length; i += 1) {
+      const b = triggers[i];
       let card = null;
       try {
         card = b.closest('article, section[data-e2e="feed-video"]');
@@ -111,7 +202,8 @@ function menuItemVideoId(target) {
         card = null;
       }
       if (!card) continue;
-      const r = card.getBoundingClientRect();
+      const r = rectOf(card);
+      if (!r) continue;
       if (cx < r.left || cx > r.right || cy < r.top || cy > r.bottom) continue;
       const dx = (r.left + r.right) / 2 - cx;
       const dy = (r.top + r.bottom) / 2 - cy;
@@ -122,7 +214,9 @@ function menuItemVideoId(target) {
       }
     }
   } catch (_) {}
-  return best;
+  add(best);
+
+  return ids;
 }
 
 /**
@@ -136,12 +230,16 @@ function menuItemVideoId(target) {
  * larger rect than the visible card. A paused card can be the one on display.
  * Area is equally misleading: stacked feed cards have identical rects.
  *
- * preferredId is the clip id read from the "..." menu that opened the click
- * (button[data-e2e="more-menu-icon"][data-more-menu-item-id]). It is the only
- * exact signal: TikTok wraps each card's player in #xgwrapper-0-<id>, so the
- * clip the menu belongs to can be named, not guessed. Note the menu lives in a
- * body-level portal, outside the card, so the id has to travel through the
- * click target or the menu button.
+ * preferredIds is the ordered list of clip ids read from the "..." menu that
+ * opened the click ([data-e2e="more-menu-icon"][data-more-menu-item-id]
+ * via menuItemVideoIds()). It is the only exact signal: TikTok wraps each
+ * card's player in #xgwrapper-0-<id>, so the clip the menu belongs to can be
+ * named, not guessed. Note the menu lives in a body-level portal, outside the
+ * card, so the id has to travel through the click target or the menu button.
+ * An id that names an off-screen clip is stale (a previously opened menu, a
+ * duplicate wrapper); it is skipped, not turned into a verdict. The first id
+ * that names a VISIBLE clip decides: if that clip cannot float, the answer is
+ * null, not a neighbour.
  *
  * With no id, Chromium's own paint order at the centre of each candidate is
  * used: elementsFromPoint() returns the whole hit-test stack, top first.
@@ -167,12 +265,18 @@ function menuItemVideoId(target) {
  * visible. readyState is checked only at the very end, so an unready top card
  * blocks the clips underneath instead of silently handing PiP to another card.
  */
-function pickVisibleVideo(preferredId) {
+function pickVisibleVideo(preferredIds) {
   const win = window;
   const doc = win.document;
   const vw = win.innerWidth || 0;
   const vh = win.innerHeight || 0;
   if (!doc || vw <= 0 || vh <= 0) return null;
+
+  const ids = Array.isArray(preferredIds)
+    ? preferredIds
+    : preferredIds
+      ? [preferredIds]
+      : [];
 
   const MIN_AREA = Math.max(400, vw * vh * 0.005); // 0.5% of the viewport
 
@@ -278,47 +382,109 @@ function pickVisibleVideo(preferredId) {
   // Exact clip named by the menu. TikTok's player wrapper is
   // #xgwrapper-0-<videoId>, the same id the "..." button carries in
   // data-more-menu-item-id. Older markup may lack the wrapper id, in which case
-  // the trigger with this id is climbed to its article/section card.
-  const videoForId = (id) => {
-    if (!id) return null;
-    const wrapperId = 'xgwrapper-0-' + id;
-    let wrapper = null;
+  // the trigger with this id is climbed to its article/section card. A wrapper
+  // that survived an SPA swap but no longer holds a video is treated the same
+  // way: climb from the trigger instead of giving up.
+  const bestVideoIn = (root) => {
+    let list = [];
     try {
-      if (typeof doc.getElementById === 'function') wrapper = doc.getElementById(wrapperId);
-    } catch (_) {}
-    if (!wrapper) {
-      try {
-        const triggers = doc.querySelectorAll(
-          'button[data-e2e="more-menu-icon"][data-more-menu-item-id]'
-        );
-        for (let i = 0; i < triggers.length; i += 1) {
-          const t = triggers[i];
-          if (t.getAttribute('data-more-menu-item-id') !== id) continue;
-          try {
-            wrapper = t.closest('article, section[data-e2e="feed-video"]');
-          } catch (_) {
-            wrapper = null;
-          }
-          if (wrapper) break;
-        }
-      } catch (_) {}
-    }
-    if (!wrapper) return null;
-    if (wrapper.tagName === 'VIDEO') return wrapper;
-    try {
-      return wrapper.querySelector('video');
+      list =
+        root.tagName === 'VIDEO'
+          ? [root]
+          : Array.prototype.slice.call(root.querySelectorAll('video'));
     } catch (_) {
-      return null;
+      list = [];
     }
+    let best = null;
+    let bestArea = -1;
+    for (let i = 0; i < list.length; i += 1) {
+      const r = visibleRectOf(list[i]);
+      const area = r ? r.area : -1;
+      if (area > bestArea) {
+        bestArea = area;
+        best = list[i];
+      }
+    }
+    return best || list[0] || null;
   };
 
-  if (preferredId) {
-    const exact = videoForId(preferredId);
-    // A resolved clip that cannot float is a deliberate "no" — never a
-    // neighbour. An id that cannot be resolved at all (older markup) falls
-    // through to the geometric path.
-    if (exact) return visibleRectOf(exact) ? finish(exact) : null;
+  const videoForId = (id) => {
+    if (!id) return null;
+
+    let wrapper = null;
+    try {
+      if (typeof doc.getElementById === 'function') {
+        wrapper = doc.getElementById('xgwrapper-0-' + id);
+      }
+    } catch (_) {}
+
+    if (wrapper) {
+      const video = bestVideoIn(wrapper);
+      if (video) return video;
+    }
+
+    try {
+      const triggers = doc.querySelectorAll(
+        '[data-e2e="more-menu-icon"][data-more-menu-item-id]'
+      );
+      for (let i = 0; i < triggers.length; i += 1) {
+        const t = triggers[i];
+        if (t.getAttribute('data-more-menu-item-id') !== id) continue;
+        let card = null;
+        try {
+          card = t.closest('article, section[data-e2e="feed-video"]');
+        } catch (_) {
+          card = null;
+        }
+        if (!card) continue;
+        const video = bestVideoIn(card);
+        if (video) return video;
+      }
+    } catch (_) {}
+
+    return null;
+  };
+
+  for (let i = 0; i < ids.length; i += 1) {
+    const id = ids[i];
+    if (!id) continue;
+    const exact = videoForId(id);
+    if (!exact) continue;
+    // The id names a clip that is not on screen (a stale menu id, a duplicate
+    // wrapper elsewhere in the SPA). That is not evidence about the visible
+    // card, so try the next signal instead of declining or floating it.
+    if (!visibleRectOf(exact)) continue;
+    // The named clip is the one the user sees. If it cannot float, decline:
+    // never fall through to a neighbour card.
+    return finish(exact);
   }
+
+  // The card, not the <video> box, is what the feed scrolls: a letterboxed
+  // player may not contain the viewport centre even though its card does.
+  const cardBox = (v) => {
+    let card = null;
+    try {
+      card = v.closest && v.closest('article, section[data-e2e="feed-video"]');
+    } catch (_) {
+      card = null;
+    }
+    if (!card) return { covers: false, area: 0 };
+    let r;
+    try {
+      r = card.getBoundingClientRect();
+    } catch (_) {
+      return { covers: false, area: 0 };
+    }
+    const left = Math.max(0, r.left);
+    const top = Math.max(0, r.top);
+    const right = Math.min(vw, r.right);
+    const bottom = Math.min(vh, r.bottom);
+    const area = Math.max(0, right - left) * Math.max(0, bottom - top);
+    const cx = vw / 2;
+    const cy = vh / 2;
+    const covers = area > 0 && cx >= left && cx <= right && cy >= top && cy <= bottom;
+    return { covers, area };
+  };
 
   const list = doc.querySelectorAll('video');
   const candidates = [];
@@ -331,10 +497,13 @@ function pickVisibleVideo(preferredId) {
     const covers = cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom;
     const dx = r.left + r.width / 2 - cx;
     const dy = r.top + r.height / 2 - cy;
+    const card = cardBox(v);
     candidates.push({
       v,
       r,
       covers,
+      cardCovers: card.covers,
+      cardArea: card.area,
       dist: covers ? 0 : Math.hypot(dx, dy),
       index: i,
       transparent: styleInfo(v).opacity <= 0.01,
@@ -354,8 +523,10 @@ function pickVisibleVideo(preferredId) {
   // stability. "playing" is intentionally absent.
   candidates.sort((a, b) => {
     if (a.transparent !== b.transparent) return a.transparent ? 1 : -1;
+    if (a.cardCovers !== b.cardCovers) return a.cardCovers ? -1 : 1;
     if (a.covers !== b.covers) return a.covers ? -1 : 1;
     if (a.dist !== b.dist) return a.dist - b.dist;
+    if (a.cardArea !== b.cardArea) return b.cardArea - a.cardArea;
     if (a.r.area !== b.r.area) return b.r.area - a.r.area;
     return a.index - b.index;
   });
@@ -464,6 +635,26 @@ function install() {
     true
   );
 
+  // TikTok leaves aria-expanded="true" on the "..." buttons of previously
+  // opened menus, so "the expanded trigger" can be an older card. Remember the
+  // button the user actually pressed instead. Pointerdown covers menus that
+  // open before a click is dispatched; click covers keyboard activation.
+  const rememberTrigger = (event) => {
+    const target = event.target;
+    if (!target || typeof target.closest !== 'function') return;
+    let trigger = null;
+    try {
+      trigger = target.closest(
+        '[data-e2e="more-menu-icon"][data-more-menu-item-id]'
+      );
+    } catch (_) {
+      trigger = null;
+    }
+    if (trigger) rememberMenuTrigger(trigger);
+  };
+  document.addEventListener('pointerdown', rememberTrigger, true);
+  document.addEventListener('click', rememberTrigger, true);
+
   // "Плавающий видеоплеер" is TikTok's "Floating Player" menu entry. It is a
   // DOCUMENT Picture-in-Picture feature, not the ordinary video PiP one.
   //
@@ -488,11 +679,11 @@ function install() {
   //
   // This is deliberately the SAME behaviour the app had before the custom
   // floating window (6c71608): the click floats one <video> natively, with no
-  // queue and no switching inside the window. The clip is resolved from the id
-  // of the "..." menu's card before the click is cancelled; if that id is not
-  // available, the card covering the centre of the viewport wins. A resolved
-  // clip that cannot float declines the click instead of substituting a
-  // neighbour.
+  // queue and no switching inside the window. The clip is resolved from the
+  // "..." trigger the user pressed before the click is cancelled; if that id is
+  // not available, the trigger nearest the open menu wins, then the card
+  // covering the centre of the viewport. A resolved clip that cannot float
+  // declines the click instead of substituting a neighbour.
   //
   // When it cannot act — native PiP unavailable, or nothing is on screen to
   // float — the click is deliberately NOT intercepted, so TikTok's own handler
@@ -513,9 +704,13 @@ function install() {
       // stopImmediatePropagation() cannot be undone, so the decision to take the
       // click over from TikTok must be complete by this point.
       const closing = Boolean(document.pictureInPictureElement);
-      const clipId = closing ? '' : menuItemVideoId(target);
-      const video = closing ? null : pickVisibleVideo(clipId);
+      const clipIds = closing ? [] : menuItemVideoIds(target);
+      const video = closing ? null : pickVisibleVideo(clipIds);
       if (!closing && (!video || video.disablePictureInPicture || video.isConnected === false)) return;
+
+      // The menu click is consumed: a remembered trigger must not leak into the
+      // next menu (for example another surface's "..." without a clip id).
+      lastMenuTrigger = null;
 
       event.preventDefault();
       event.stopImmediatePropagation();
