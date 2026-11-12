@@ -627,13 +627,18 @@ function pickVisibleVideo(preferredIds) {
 //   * the feed stays the single source of truth — no second window, no second
 //     TikTok session, no queue built from a different page (that is what the
 //     removed custom player did, and why its recommendations differed);
-//   * whenever the visible card's <video> is not the PiP element, PiP is
-//     re-requested on it. Per the PiP spec, step 7 of requestPictureInPicture(),
-//     user activation is required ONLY while document.pictureInPictureElement
-//     is null — swapping the video of an ALREADY OPEN window needs no gesture.
-//     That is what makes the mirror possible at all;
+//   * the window is re-pointed at the clip the feed shows when the feed moved
+//     or when the element was recycled. It is NOT re-pointed just because
+//     another card happens to be visible — the user may have floated a
+//     neighbour card on purpose, and taking the window away from it one tick
+//     later would be its own bug;
 //   * "next" is a scroll of the real feed, so the window, the feed and the
 //     recommendations order can never diverge: they are the same list.
+//
+// Swapping the video of an ALREADY OPEN window needs no user gesture (the
+// gesture is required only for the first requestPictureInPicture()). That is
+// what makes the mirror possible at all — and it is also why the mirror
+// gives up after a few refusals instead of retrying forever.
 //
 // Auto-advance: TikTok's own «Автоматическая прокрутка» moves the feed when a
 // clip ends, and the mirror follows it. When that toggle is off, the ended clip
@@ -642,14 +647,17 @@ function pickVisibleVideo(preferredIds) {
 
 const PIP_POLL_MS = 400; // idle re-check; events below cover the fast paths
 const PIP_SWAP_MIN_MS = 400; // throttle: a scroll animation must not flap the window
+const PIP_SCAN_MIN_MS = 700; // how often the feed may be scanned at all
 const PIP_ENDED_GRACE_MS = 2500; // let TikTok's own auto-scroll act first
 const PIP_ADVANCE_CHECK_MS = 800; // did the feed actually move?
 const PIP_MAX_CONSECUTIVE_FAILURES = 5; // Chromium refuses the swap -> stop trying
+const PIP_SWAP_TIMEOUT_MS = 5000; // a promise that never settles must not freeze the mirror
 
 const pip = {
   active: false,
   timer: 0,
   swappedAt: 0,
+  scannedAt: 0,
   swapping: false,
   lastId: '',
   lastVisiblePrint: '',
@@ -948,7 +956,14 @@ function pipAdvance(dir, reason) {
   tryNext();
 }
 
-/** The clip the feed is showing right now: the same resolver as the click path. */
+/**
+ * The clip the feed is showing right now.
+ *
+ * This is the GEOMETRY fallback, not the click path: a click resolves the
+ * clip by its id (menuItemVideoIds), because the menu knows which card was
+ * clicked. The mirror has no such hint — it can only look at what is on
+ * screen — so it takes the card that covers the centre of the viewport.
+ */
 function pipVisible() {
   const video = pickVisibleVideo([]);
   if (!video) return null;
@@ -1015,6 +1030,12 @@ function pipSync(reason) {
   }
   const now = Date.now();
   if (pip.swapping || now - pip.swappedAt < PIP_SWAP_MIN_MS) return;
+  // A full scan of the feed is expensive (hundreds of getComputedStyle
+  // calls). On a trackpad the events arrive dozens of times a second, and the
+  // guest page starts to stutter, so the feed is scanned at most every
+  // PIP_SCAN_MIN_MS. The events only say "something changed".
+  if (now - pip.scannedAt < PIP_SCAN_MIN_MS) return;
+  pip.scannedAt = now;
   const visible = pipVisible();
   if (!visible || !visible.video) return;
   const next = visible.video;
@@ -1061,6 +1082,7 @@ function pipSync(reason) {
   }
   p.then(
     () => {
+      clearTimeout(guard);
       pip.swapping = false;
       pip.swaps += 1;
       pip.consecutiveFailures = 0;
@@ -1087,6 +1109,7 @@ function pipSync(reason) {
       }
     },
     (err) => {
+      clearTimeout(guard);
       pip.swapping = false;
       pip.failures += 1;
       pip.consecutiveFailures += 1;
@@ -1104,6 +1127,16 @@ function pipSync(reason) {
       }
     }
   );
+  // A promise that never settles would leave pip.swapping true for the rest
+  // of the session and the mirror would stop working silently.
+  const guard = setTimeout(() => {
+    if (!pip.swapping) return;
+    pip.swapping = false;
+    pip.failures += 1;
+    pip.consecutiveFailures += 1;
+    pipReport('swap-timeout', 'promise did not settle');
+  }, PIP_SWAP_TIMEOUT_MS);
+  if (guard.unref) guard.unref();
 }
 
 /** Media Session is what puts «next / previous» buttons in the PiP window. */
