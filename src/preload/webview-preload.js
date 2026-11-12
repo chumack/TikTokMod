@@ -597,6 +597,672 @@ function pickVisibleVideo(preferredIds) {
   return null;
 }
 
+// ============================================================================
+// The floating player is a MIRROR of the "Обзор" feed
+// ============================================================================
+//
+// THE BUG THIS FIXES, measured from the user's own report: the floating window
+// played "the right clip, then a clip that is not in the recommendations feed
+// at all, then the next clip of the feed, and so on every time".
+//
+// That cycle is not a picking error — the clip is resolved correctly at the
+// moment of the click (menuItemVideoIds + pickVisibleVideo below). It is what
+// native Picture-in-Picture does afterwards:
+//
+//   * PiP is bound to ONE <video> ELEMENT for the whole session. There is no
+//     API to hand the window a playlist, and the window has no idea a feed
+//     exists.
+//   * TikTok's feed is a list of CARDS served by a small pool of recycled
+//     xgplayer instances. The element that played the floated clip is handed
+//     the next-but-one clip to prefetch (a clip that is not on screen and may
+//     never be rendered), then a feed clip again. The window follows the
+//     element, so it alternates between "the feed" and "whatever this element
+//     was recycled to".
+//   * Scrolling the feed under the window makes it worse: the page keeps
+//     advancing its own cards while the window stays on its element.
+//
+// So the window can never be "the feed" on its own. What DOES work is to keep
+// re-pointing it at the clip the feed is showing:
+//
+//   * the feed stays the single source of truth — no second window, no second
+//     TikTok session, no queue built from a different page (that is what the
+//     removed custom player did, and why its recommendations differed);
+//   * whenever the visible card's <video> is not the PiP element, PiP is
+//     re-requested on it. Per the PiP spec, step 7 of requestPictureInPicture(),
+//     user activation is required ONLY while document.pictureInPictureElement
+//     is null — swapping the video of an ALREADY OPEN window needs no gesture.
+//     That is what makes the mirror possible at all;
+//   * "next" is a scroll of the real feed, so the window, the feed and the
+//     recommendations order can never diverge: they are the same list.
+//
+// Auto-advance: TikTok's own «Автоматическая прокрутка» moves the feed when a
+// clip ends, and the mirror follows it. When that toggle is off, the ended clip
+// would sit in the window forever, so the mirror scrolls the feed itself after
+// a grace period.
+
+const PIP_POLL_MS = 400; // idle re-check; events below cover the fast paths
+const PIP_SWAP_MIN_MS = 400; // throttle: a scroll animation must not flap the window
+const PIP_ENDED_GRACE_MS = 2500; // let TikTok's own auto-scroll act first
+const PIP_ADVANCE_CHECK_MS = 800; // did the feed actually move?
+const PIP_MAX_CONSECUTIVE_FAILURES = 5; // Chromium refuses the swap -> stop trying
+
+const pip = {
+  active: false,
+  timer: 0,
+  swappedAt: 0,
+  swapping: false,
+  lastId: '',
+  lastVisiblePrint: '',
+  anchorVideo: null,
+  anchorPrint: '',
+  swaps: 0,
+  failures: 0,
+  consecutiveFailures: 0,
+  advances: 0,
+  endedTimer: 0,
+  advanceTimers: [],
+  lastReportedAt: {},
+  lastReason: '',
+};
+
+/** Diagnostics for the app's «Диагностика» dialog and the main-process log. */
+function pipReport(type, detail) {
+  try {
+    const now = Date.now();
+    // Swaps happen on every card change; a long session must not flood IPC.
+    // Every type is throttled on its own: a failure must not silence the
+    // success that follows it.
+    const last = pip.lastReportedAt[type] || 0;
+    if (now - last < 250) return;
+    pip.lastReportedAt[type] = now;
+    ipcRenderer.send('feed:pip', {
+      type,
+      detail: detail || null,
+      id: pip.lastId || '',
+      swaps: pip.swaps,
+      failures: pip.failures,
+      advances: pip.advances,
+    });
+  } catch (_) {}
+}
+
+/**
+ * The clip id a <video> belongs to, or ''. The player wrapper is
+ * #xgwrapper-0-<clipId>; older markup carries the id on a data attribute or on
+ * the card's own "..." trigger. Used only to tell "the feed moved" from "the
+ * same card is still on screen", never to guess which clip to float.
+ */
+function pipClipId(video) {
+  if (!video) return '';
+  let el = video;
+  for (let i = 0; i < 14 && el && el.nodeType === 1; i += 1, el = el.parentElement) {
+    const own = typeof el.id === 'string' ? el.id : '';
+    if (own.indexOf('xgwrapper-') === 0) {
+      const tail = own.split('-').pop();
+      if (VIDEO_ID_RE.test(tail)) return tail;
+    }
+    try {
+      const attrs = ['data-more-menu-item-id', 'data-e2e-vid', 'data-vid', 'data-video-id', 'data-aweme-id'];
+      for (let j = 0; j < attrs.length; j += 1) {
+        const v = el.getAttribute && el.getAttribute(attrs[j]);
+        if (v && VIDEO_ID_RE.test(v)) return v;
+      }
+    } catch (_) {}
+    if (el === document.body) break;
+  }
+  try {
+    const card = video.closest('article, section[data-e2e="feed-video"], [data-e2e="feed-video"]');
+    const trigger = card && card.querySelector('[data-e2e="more-menu-icon"][data-more-menu-item-id]');
+    const id = trigger && trigger.getAttribute('data-more-menu-item-id');
+    if (id && VIDEO_ID_RE.test(id)) return id;
+  } catch (_) {}
+  return '';
+}
+
+/**
+ * The scroll box the feed actually scrolls — the same rule as feed.js: the
+ * scrollable box that holds the clip links of the feed. Taking the first
+ * scrollable ancestor instead used to pick whatever column happened to be
+ * scrollable, and on a video page that can be the recommendation sidebar.
+ */
+function pipScrollBox(video) {
+  const scrollable = (el) => {
+    try {
+      const cs = window.getComputedStyle(el);
+      const oy = (cs && (cs.overflowY || cs.overflow)) || '';
+      if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') return false;
+      return el.scrollHeight > el.clientHeight + 40;
+    } catch (_) {
+      return false;
+    }
+  };
+
+  // The feed's own links to clips.
+  const anchors = [];
+  try {
+    const links = document.querySelectorAll('a[href]');
+    for (let i = 0; i < links.length; i += 1) {
+      const href = links[i].getAttribute('href') || '';
+      if (href.indexOf('/video/') >= 0) anchors.push(links[i]);
+    }
+  } catch (_) {}
+
+  // Start from the biggest visible video, like feed.js does.
+  const starts = [];
+  try {
+    const list = document.querySelectorAll('video');
+    const sized = [];
+    for (let i = 0; i < list.length; i += 1) {
+      const r = rectOf(list[i]);
+      sized.push({ v: list[i], area: r ? r.width * r.height : 0 });
+    }
+    sized.sort((a, b) => b.area - a.area);
+    for (const it of sized) starts.push(it.v);
+  } catch (_) {}
+  if (video) starts.unshift(video);
+
+  for (let s = 0; s < starts.length; s += 1) {
+    let el = starts[s] && starts[s].parentElement;
+    for (let i = 0; i < 25 && el && el.nodeType === 1 && el !== document.body; i += 1, el = el.parentElement) {
+      if (!scrollable(el)) continue;
+      if (!anchors.length) return el; // no clip links: this column is all we have
+      for (const a of anchors) {
+        if (el.contains(a)) return el;
+      }
+    }
+  }
+  // Nothing found: the window itself must NOT be scrolled — that would throw
+  // the user out of the feed.
+  return null;
+}
+
+function pipCardOf(video) {
+  try {
+    return video.closest('article, section[data-e2e="feed-video"], [data-e2e="feed-video"]');
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * TikTok's own chevron for "next / previous clip", if this layout renders one.
+ * Clicking it is the most faithful way to advance: the page runs its own
+ * prefetch and play logic. Only visible buttons inside this feed are accepted,
+ * so a chevron belonging to another column cannot be pressed by mistake.
+ */
+function pipSwitchButton(dir, box, card) {
+  const selectors = dir > 0
+    ? ['[data-e2e="feed-arrow-down"]', '[data-e2e="arrow-down"]', '[data-e2e="feed-arrow-right"]', '[data-e2e="arrow-right"]']
+    : ['[data-e2e="feed-arrow-up"]', '[data-e2e="arrow-up"]', '[data-e2e="feed-arrow-left"]', '[data-e2e="arrow-left"]'];
+  const wanted = dir > 0 ? /следующ|вниз|next|down/i : /предыдущ|вверх|previous|prev|up/i;
+  const found = [];
+  const push = (el) => {
+    if (!el || found.indexOf(el) !== -1) return;
+    const r = rectOf(el);
+    if (!r) return;
+    // Only a button of THIS feed column may be pressed. Without a column and
+    // a card the check would accept any button on the page — «Скачать» or
+    // «прокрутить вниз» included.
+    if (!box && !card) return;
+    if (box && el !== box && !box.contains(el) && !(card && card.contains(el))) return;
+    if (!box && card && !card.contains(el)) return;
+    found.push(el);
+  };
+  for (let i = 0; i < selectors.length; i += 1) {
+    let list = [];
+    try {
+      list = document.querySelectorAll(selectors[i]);
+    } catch (_) {
+      list = [];
+    }
+    for (let j = 0; j < list.length; j += 1) push(list[j]);
+    if (found.length) break;
+  }
+  if (!found.length) {
+    // Locales without a known data-e2e: the aria-label still names the action.
+    let buttons = [];
+    try {
+      buttons = document.querySelectorAll('button[aria-label], [role="button"][aria-label]');
+    } catch (_) {
+      buttons = [];
+    }
+    for (let i = 0; i < buttons.length; i += 1) {
+      const label = buttons[i].getAttribute('aria-label') || '';
+      if (wanted.test(label)) push(buttons[i]);
+    }
+  }
+  return found.length ? found[0] : null;
+}
+
+/**
+ * Moves the REAL feed one card forward/back. Strategies are tried in order and
+ * each is verified by the clip id actually changing, because a scroll that the
+ * page ignores must not look like a successful "next".
+ */
+function pipAdvance(dir, reason) {
+  if (!pip.active) return;
+  const step = dir >= 0 ? 1 : -1;
+  const current = pipVisible();
+  const fromPrint = (current && pipFingerprint(current.video)) || pip.anchorPrint;
+  const video = (current && current.video) || document.pictureInPictureElement;
+  const box = pipScrollBox(video);
+  const card = pipCardOf(video);
+  pip.advances += 0;
+  pipReport('advance-try', `${reason || 'manual'} ${step > 0 ? 'next' : 'prev'}`);
+
+  const moved = () => {
+    const now = pipVisible();
+    if (!now || !now.video) return false;
+    const print = pipFingerprint(now.video);
+    // No identity in this markup at all: "a different element is on screen" is
+    // then the only available evidence that the feed moved.
+    if (!print && !fromPrint) return now.video !== video;
+    return Boolean(print && print !== fromPrint);
+  };
+
+  const strategies = [
+    () => {
+      const btn = pipSwitchButton(step, box, card);
+      if (!btn) return false;
+      try {
+        btn.click();
+        return true;
+      } catch (_) {
+        return false;
+      }
+    },
+    () => {
+      if (!box) return false;
+      const h = card && card.offsetHeight ? card.offsetHeight : 0;
+      // The step of feed.js: a little less than a screen, so a card is not
+      // skipped over.
+      const unit =
+        h > box.clientHeight * 0.5 && h < box.clientHeight * 1.5
+          ? h
+          : Math.round(box.clientHeight * 0.9);
+      if (!(unit > 0)) return false;
+      try {
+        box.scrollTo({ top: box.scrollTop + step * unit, behavior: 'smooth' });
+        return true;
+      } catch (_) {
+        box.scrollTop += step * unit;
+        return true;
+      }
+    },
+    () => {
+      if (!box) return false;
+      const unit = Math.round((box.clientHeight || window.innerHeight) * 0.9);
+      try {
+        box.scrollTop += step * unit;
+        // Some layouts only react to a wheel event (same trick as feed.js).
+        box.dispatchEvent(new WheelEvent('wheel', { deltaY: step * 1200, bubbles: true }));
+        return true;
+      } catch (_) {
+        return false;
+      }
+    },
+  ];
+
+  let attempt = 0;
+  let misses = 0;
+  const tryNext = () => {
+    if (!pip.active) return;
+    if (moved()) {
+      // Only a confirmed move counts: a scroll the page ignored must not look
+      // like a successful "next".
+      pip.advances += 1;
+      pipReport('advance', (reason || 'manual') + ' ok');
+      pipSync('advanced');
+      return;
+    }
+    misses += 1;
+    if (misses >= 2 && attempt < strategies.length) {
+      // The previous strategy did not move the feed: try the next one. Two
+      // strategies in a row would skip a clip, so the next one is used only
+      // after the current one has clearly failed.
+      misses = 0;
+      const run = strategies[attempt];
+      attempt += 1;
+      let ok = false;
+      try {
+        ok = run();
+      } catch (_) {
+        ok = false;
+      }
+      if (!ok) {
+        tryNext();
+        return;
+      }
+    } else if (attempt >= strategies.length) {
+      // End of the loaded feed, or a layout none of the strategies moves.
+      pipReport('advance-stuck', reason || null);
+      return;
+    }
+    const t = setTimeout(() => {
+      pip.advanceTimers = pip.advanceTimers.filter((x) => x !== t);
+      tryNext();
+    }, PIP_ADVANCE_CHECK_MS);
+    if (t.unref) t.unref();
+    pip.advanceTimers.push(t);
+  };
+  tryNext();
+}
+
+/** The clip the feed is showing right now: the same resolver as the click path. */
+function pipVisible() {
+  const video = pickVisibleVideo([]);
+  if (!video) return null;
+  return { video, id: pipClipId(video) };
+}
+
+/**
+ * Identity of what a <video> is playing: the clip id when the markup carries
+ * one, otherwise the media URL. MSE hands TikTok a fresh blob: URL every time
+ * a player is re-bound to another clip, so a changed fingerprint is the signal
+ * that the element was recycled — which is precisely the moment the floating
+ * window starts showing a clip that is not in the feed.
+ */
+function pipFingerprint(video) {
+  if (!video) return '';
+  // Both parts matter: the id names the clip, the media URL names the MEDIA
+  // the element currently carries. MSE hands TikTok a fresh blob: URL every
+  // time a player is re-bound to another clip, so the URL is the signal that
+  // the element was recycled even when the wrapper kept its id.
+  const parts = [];
+  const id = pipClipId(video);
+  if (id) parts.push('id:' + id);
+  try {
+    const src = video.currentSrc || video.src || '';
+    if (src) parts.push('src:' + src);
+  } catch (_) {}
+  return parts.join('|');
+}
+
+/**
+ * Re-points the open PiP window at the clip the feed is showing.
+ *
+ * Two conditions can trigger a swap, and nothing else can:
+ *   * the feed moved — the visible clip is not the one it was a moment ago;
+ *   * the floated element was recycled — it no longer plays the clip it was
+ *     floated with (TikTok handed it a prefetch clip).
+ *
+ * The second condition is what kills the reported "right clip → foreign clip →
+ * next feed clip" cycle. The first is what keeps the window on the feed when
+ * the user scrolls, or when auto-scroll advances it.
+ *
+ * Deliberately NOT a trigger: "the PiP element is not the visible one" on its
+ * own. The user may have floated a neighbour card on purpose, and taking that
+ * away one tick later would be its own bug.
+ *
+ * Declines (keeps the window as it is) when nothing is visible, when the clip
+ * is not ready, or when PiP is not open — it never opens a window on its own,
+ * because that DOES need a user gesture.
+ */
+function pipSync(reason) {
+  if (!pip.active) return;
+  let open = null;
+  try {
+    open = document.pictureInPictureElement;
+  } catch (_) {
+    return;
+  }
+  // The window is gone: there is nothing to mirror. The leavepictureinpicture
+  // event cannot be trusted for this — the spec fires it for a SWAP as well —
+  // so the poll is the reliable place to notice a real close.
+  if (!open) {
+    pipStop();
+    return;
+  }
+  const now = Date.now();
+  if (pip.swapping || now - pip.swappedAt < PIP_SWAP_MIN_MS) return;
+  const visible = pipVisible();
+  if (!visible || !visible.video) return;
+  const next = visible.video;
+  const visiblePrint = pipFingerprint(next);
+
+  if (next === open) {
+    pip.lastId = visible.id || pip.lastId;
+    // The window already shows the feed's clip, so the movement is accounted
+    // for and the next tick must not mistake it for a new card.
+    pip.lastVisiblePrint = visiblePrint;
+    return;
+  }
+
+  const openPrint = pipFingerprint(open);
+  const feedMoved = Boolean(visiblePrint && pip.lastVisiblePrint && visiblePrint !== pip.lastVisiblePrint);
+  const recycled = Boolean(openPrint && pip.anchorPrint && openPrint !== pip.anchorPrint);
+  const anchorGone = Boolean(pip.anchorVideo && pip.anchorVideo.isConnected === false);
+  // pip.lastVisiblePrint is deliberately NOT updated here: while the new clip
+  // is not ready yet, the movement must stay "unseen" so the next tick tries
+  // again. Updating it now would leave the window on the old clip for good.
+  if (reason !== 'advanced' && !feedMoved && !recycled && !anchorGone) return;
+
+  if (next.disablePictureInPicture || next.error) return;
+  if (!(next.readyState > 0)) return; // prefetch tag with no track yet
+  if (typeof next.requestPictureInPicture !== 'function') return;
+
+  const wasPlaying = !open.paused && !open.ended;
+  const prev = open;
+  pip.swapping = true;
+  pip.swappedAt = now;
+  pip.lastId = visible.id || '';
+  let p = null;
+  try {
+    p = next.requestPictureInPicture();
+  } catch (_) {
+    p = null;
+  }
+  if (!p || typeof p.then !== 'function') {
+    pip.swapping = false;
+    pip.failures += 1;
+    pip.consecutiveFailures += 1;
+    pipReport('swap-failed', 'no-promise');
+    return;
+  }
+  p.then(
+    () => {
+      pip.swapping = false;
+      pip.swaps += 1;
+      pip.consecutiveFailures = 0;
+      pip.lastVisiblePrint = visiblePrint;
+      pip.lastReason = reason || (recycled ? 'recycled' : 'feed');
+      pip.anchorVideo = next;
+      pip.anchorPrint = pipFingerprint(next);
+      // The element the window came from is either off screen or handed to the
+      // prefetcher, but it keeps playing in the page: that would be a second
+      // audio track on top of the window.
+      if (prev && prev !== next) {
+        try {
+          prev.pause();
+        } catch (_) {}
+      }
+      pipReport('swap', pip.lastReason);
+      // Continuity: the window was playing, so the clip it now shows plays too.
+      // A window the user paused stays paused — wasPlaying is false then.
+      if (wasPlaying && next.paused && !next.ended) {
+        try {
+          const play = next.play();
+          if (play && typeof play.catch === 'function') play.catch(() => {});
+        } catch (_) {}
+      }
+    },
+    (err) => {
+      pip.swapping = false;
+      pip.failures += 1;
+      pip.consecutiveFailures += 1;
+      const name = (err && (err.name || err.message)) || 'error';
+      pipReport('swap-failed', name);
+      // Chromium can refuse the swap (it wants a user gesture). Retrying
+      // forever would spam the page and the log, and the mirror must not keep
+      // scrolling the feed while it cannot do its job: after a few refusals it
+      // gives up and reports why.
+      if (pip.consecutiveFailures >= PIP_MAX_CONSECUTIVE_FAILURES) {
+        pip.active = false;
+        if (pip.timer) clearInterval(pip.timer);
+        pip.timer = 0;
+        pipReport('mirror-disabled', 'swap failed ' + pip.consecutiveFailures + 'x: ' + name);
+      }
+    }
+  );
+}
+
+/** Media Session is what puts «next / previous» buttons in the PiP window. */
+function pipInstallActions() {
+  try {
+    const ms = navigator.mediaSession;
+    if (!ms || typeof ms.setActionHandler !== 'function') return;
+    // The handlers are NOT released when the window closes: the Media Session
+    // API has no getter, so removing them would take the page's own handlers
+    // with them, irreversibly. Our handlers check pip.active themselves and
+    // do nothing once the mirror is off.
+    ms.setActionHandler('nexttrack', () => pipAdvance(1, 'mediasession'));
+    ms.setActionHandler('previoustrack', () => pipAdvance(-1, 'mediasession'));
+  } catch (_) {}
+}
+
+function pipStart(anchorEl) {
+  const el = anchorEl || null;
+  if (pip.active) {
+    // The window was opened again on another clip (the user pressed Chromium's
+    // own PiP button). That clip is the new anchor: taking the window away
+    // from it one tick later would be its own bug.
+    if (el && el !== pip.anchorVideo) {
+      pip.anchorVideo = el;
+      pip.anchorPrint = pipFingerprint(el);
+    }
+    return;
+  }
+  pip.active = true;
+  pip.consecutiveFailures = 0;
+  // What the user floated is the anchor: the mirror only takes the window away
+  // from it when the feed moves or the element is recycled, never just because
+  // another card happens to be the visible one.
+  pip.anchorVideo = el || document.pictureInPictureElement || null;
+  pip.anchorPrint = pipFingerprint(pip.anchorVideo);
+  pip.lastId = pipClipId(pip.anchorVideo);
+  const visible = pipVisible();
+  pip.lastVisiblePrint = visible ? pipFingerprint(visible.video) : pip.anchorPrint;
+  pipInstallActions();
+  pip.timer = setInterval(() => pipSync('poll'), PIP_POLL_MS);
+  if (pip.timer.unref) pip.timer.unref();
+  pipReport('open', null);
+}
+
+function pipStop() {
+  if (!pip.active) return;
+  pip.active = false;
+  if (pip.timer) clearInterval(pip.timer);
+  pip.timer = 0;
+  if (pip.endedTimer) clearTimeout(pip.endedTimer);
+  pip.endedTimer = 0;
+  for (const t of pip.advanceTimers) clearTimeout(t);
+  pip.advanceTimers = [];
+  pip.swapping = false;
+  pip.anchorVideo = null;
+  pip.anchorPrint = '';
+  pip.lastVisiblePrint = '';
+  pipReport('close', null);
+}
+
+/**
+ * A window that was closed by the user must stop the mirror; a window whose
+ * video was SWAPPED must not. The spec fires leavepictureinpicture on the old
+ * element before the new one is assigned, so the decision is taken one task
+ * later, when document.pictureInPictureElement is settled.
+ */
+function pipCheckStillOpen() {
+  setTimeout(() => {
+    let open = null;
+    try {
+      open = document.pictureInPictureElement;
+    } catch (_) {}
+    if (open) pipStart(open);
+    else pipStop();
+  }, 60);
+}
+
+function installPipMirror() {
+  if (window.__tkmPipMirrorDoc === document) return;
+  window.__tkmPipMirrorDoc = document;
+
+  // The event carries the element the window was opened on: that is the
+  // anchor, even when the mirror was already running.
+  document.addEventListener(
+    'enterpictureinpicture',
+    (event) => pipStart((event && event.target) || null),
+    true
+  );
+  document.addEventListener('leavepictureinpicture', () => pipCheckStillOpen(), true);
+
+  // The fast paths. A recycled element announces itself with loadstart/emptied
+  // long before the next poll: that is the exact moment the window would start
+  // showing a clip that is not in the feed.
+  const onFeedSignal = () => pipSync('signal');
+  document.addEventListener('scroll', onFeedSignal, true);
+  document.addEventListener('loadstart', onFeedSignal, true);
+  document.addEventListener('emptied', onFeedSignal, true);
+  document.addEventListener('loadeddata', onFeedSignal, true);
+  document.addEventListener('playing', onFeedSignal, true);
+  window.addEventListener('resize', onFeedSignal);
+
+  // Auto-advance when TikTok's own «Автоматическая прокрутка» is off. The grace
+  // period lets the page move the feed first, so the two never fight.
+  document.addEventListener(
+    'ended',
+    (event) => {
+      if (!pip.active) return;
+      const target = event.target;
+      if (!target || target !== document.pictureInPictureElement) return;
+      if (pip.endedTimer) clearTimeout(pip.endedTimer);
+      const endedId = pipClipId(target);
+      // The fingerprint, not the element: the page reuses the same <video> for
+      // the next clip, so "the element changed" would never fire and the
+      // mirror would scroll the feed a second time, past a clip.
+      const endedPrint = pipFingerprint(target);
+      pip.endedTimer = setTimeout(() => {
+        pip.endedTimer = 0;
+        if (!pip.active) return;
+        // A mirror that cannot switch the window must not move the feed.
+        if (pip.consecutiveFailures > pip.swaps) return;
+        const now = pipVisible();
+        if (!now || !now.video) return;
+        if (endedPrint && pipFingerprint(now.video) !== endedPrint) return; // page moved
+        if (now.id && endedId && now.id !== endedId) return; // page moved
+        pipAdvance(1, 'ended');
+      }, PIP_ENDED_GRACE_MS);
+      if (pip.endedTimer.unref) pip.endedTimer.unref();
+    },
+    true
+  );
+
+  // A window that was already open when this document was armed (SPA swap).
+  try {
+    if (document.pictureInPictureElement) pipStart(document.pictureInPictureElement);
+  } catch (_) {}
+
+  // Read-only handle for the self-test and for debugging in the guest console.
+  window.__tkmPip = {
+    get active() {
+      return pip.active;
+    },
+    get swaps() {
+      return pip.swaps;
+    },
+    get failures() {
+      return pip.failures;
+    },
+    get advances() {
+      return pip.advances;
+    },
+    get lastId() {
+      return pip.lastId;
+    },
+    sync: (why) => pipSync(why || 'manual'),
+    next: () => pipAdvance(1, 'manual'),
+    prev: () => pipAdvance(-1, 'manual'),
+  };
+}
+
 function install() {
   // Guard on the document, not on window: TikTok's SPA swaps the document on
   // route changes, and a listener left on the old one is dead. Re-attaching per
@@ -604,6 +1270,11 @@ function install() {
   if (window.__tkmPreloadHooks && window.__tkmPreloadDoc === document) return;
   window.__tkmPreloadHooks = true;
   window.__tkmPreloadDoc = document;
+
+  // The floating window must follow the feed for the whole session, not just
+  // resolve the right clip once at the click. Armed independently of the menu
+  // interception: PiP opened by Chromium's own toolbar button is mirrored too.
+  installPipMirror();
   document.addEventListener(
     'contextmenu',
     (event) => {
@@ -720,7 +1391,16 @@ function install() {
         document.exitPictureInPicture().catch(() => {});
         return;
       }
-      video.requestPictureInPicture().catch(() => {});
+      // The mirror takes over from the enterpictureinpicture event; anchoring it
+      // here as well means the clicked clip is the reference even if that event
+      // is delivered before this promise settles.
+      pip.anchorVideo = video;
+      pip.anchorPrint = pipFingerprint(video);
+      pip.lastId = clipIds.length ? clipIds[0] : pipClipId(video);
+      video.requestPictureInPicture().then(
+        () => pipStart(),
+        (err) => pipReport('open-failed', (err && (err.name || err.message)) || 'error')
+      );
     },
     true
   );

@@ -2271,6 +2271,38 @@ emit(false);
    });
 
 /**
+ * Single place that marks the audio side finished, so every path (exit, crash,
+ * wait-timeout) cancels the pending escalation timers and stops the growth
+ * poller. Nulling the handles without clearTimeout left live SIGTERM / SIGKILL
+ * timers pointing at an already-dead process.
+ *
+ * SCOPE: this must live in startScreen()'s own body, NOT inside the
+ * `if (job.audioChild)` wiring block where it used to be declared. finishScreen()
+ * calls it from the audio-wait timeout, and that call site is outside the block:
+ * a block-scoped `const` there is not visible here at all, so the timeout threw
+ * `ReferenceError: markAudioClosed is not defined` from a timer callback — an
+ * uncaught exception in the main process ("A JavaScript error occurred" dialog),
+ * finalize() never ran, and the recording was left as un-muxed sidecars.
+ */
+const markAudioClosed = () => {
+  if (job.audioClosed) return false;
+  job.audioClosed = true;
+  if (job.audioStopTimer) {
+    clearTimeout(job.audioStopTimer);
+    job.audioStopTimer = null;
+  }
+  if (job.audioKillTimer) {
+    clearTimeout(job.audioKillTimer);
+    job.audioKillTimer = null;
+  }
+  if (job.audioPollTimer) {
+    clearInterval(job.audioPollTimer);
+    job.audioPollTimer = null;
+  }
+  return true;
+};
+
+/**
    * Combines the finished video and audio sidecars into the final file.
    *
    * Order matters and is the reason this is a function at all:
@@ -2595,28 +2627,6 @@ const finishScreen = () => {
       ac.stderr.on('data', (d) => {
         job.audioErrTail = (job.audioErrTail + d.toString()).slice(-2000);
       });
-// Single place that marks the audio side finished, so every path (exit,
-   // crash, wait-timeout) cancels the pending escalation timers and stops the
-   // growth poller. Nulling the handles without clearTimeout left live SIGTERM /
-      // SIGKILL timers pointing at an already-dead process.
-    const markAudioClosed = () => {
-      if (job.audioClosed) return false;
-   job.audioClosed = true;
-    if (job.audioStopTimer) {
-   clearTimeout(job.audioStopTimer);
-      job.audioStopTimer = null;
- }
-      if (job.audioKillTimer) {
-        clearTimeout(job.audioKillTimer);
-        job.audioKillTimer = null;
-      }
-      if (job.audioPollTimer) {
-     clearInterval(job.audioPollTimer);
-   job.audioPollTimer = null;
-      }
-    return true;
-    };
-
       ac.on('error', (e) => {
       journal(`audio process error: ${e && (e.message || e)}`);
         if (!markAudioClosed()) return;

@@ -1177,6 +1177,41 @@ function signerLine(s) {
   return `gnarly X-Gnarly ${signer.status(s).gnarly.version || '?'}`;
 }
 
+// What the guest's floating-player mirror is doing right now
+// (src/preload/webview-preload.js). The mirror keeps the Picture-in-Picture
+// window on the clip the «Обзор» feed is showing; TikTok recycles its player
+// elements, so the window has to be re-pointed. These numbers are the only
+// proof on a live client that the window follows the feed and not the
+// recycled element. Diagnostics only — the app paints nothing on it.
+const pipState = {
+  type: '',
+  detail: '',
+  id: '',
+  swaps: 0,
+  failures: 0,
+  advances: 0,
+  at: 0,
+};
+ipcMain.on('feed:pip', (_e, info) => {
+  if (!info || typeof info !== 'object') return;
+  pipState.type = String(info.type || '');
+  pipState.detail = info.detail ? String(info.detail) : '';
+  pipState.id = String(info.id || '');
+  pipState.swaps = Number(info.swaps) || 0;
+  pipState.failures = Number(info.failures) || 0;
+  pipState.advances = Number(info.advances) || 0;
+  pipState.at = Date.now();
+  console.log(
+    '[pip]',
+    pipState.type,
+    pipState.detail,
+    pipState.id || '-',
+    'swaps=' + pipState.swaps,
+    'failures=' + pipState.failures,
+    'advances=' + pipState.advances
+  );
+});
+
 async function showDiagnostics() {
   const st = binaries.status();
   const v = await ytdlp.version();
@@ -1191,7 +1226,12 @@ async function showDiagnostics() {
     `Прокси: ${s.proxy || 'не задан'}`,
     `Cookies из браузера: ${s.cookiesFromBrowser}`,
     `Движок метаданных: ${engine.engineOf(s)}`,
-    `Подпись запросов: ${signLine(s)}`,
+    `Подпись запросов: ${signerLine(s)}`,
+    '',
+    `Плавающий видеоплеер:`,
+    `  ${pipState.type ? pipState.type + (pipState.detail ? ' (' + pipState.detail + ')' : '') : 'окно не открыто'}`,
+    `  ролик в окне: ${pipState.id || '—'}`,
+    `  переключений: ${pipState.swaps}, ошибок: ${pipState.failures}, прокруток: ${pipState.advances}`,
     '',
     `Эмулируемое устройство:`,
     `  регион: ${profile.region} (${profile.country}), оператор ${profile.carrier || '—'} ${profile.carrierMccmnc}`,
