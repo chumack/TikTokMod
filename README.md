@@ -7,11 +7,11 @@ TikTok, скачивание видео (приоритет форматов б�
 
 ## Установка
 
-Текущая версия — **0.4.8**. Один релиз на GitHub содержит и Windows, и Linux.
+Текущая версия — **0.4.9**. Один релиз на GitHub содержит и Windows, и Linux.
 
 ### Windows
 
-Установщик для Windows: `TikTokMod-Setup-0.4.8-x64.exe`.
+Установщик для Windows: `TikTokMod-Setup-0.4.9-x64.exe`.
 
 - Установка **для всех пользователей** — установщик запрашивает права
   администратора. Папка по умолчанию — `C:\Program Files\TikTokMod`; на странице
@@ -26,7 +26,7 @@ TikTok, скачивание видео (приоритет форматов б�
   деинсталлятор.
 
 Для тех, кому установка не нужна, есть portable-сборка
-`TikTokMod-Portable-0.4.8-x64.exe` — запускается напрямую, ничего не регистрируя
+`TikTokMod-Portable-0.4.9-x64.exe` — запускается напрямую, ничего не регистрируя
 в системе.
 
 > Версия 0.1.0 ставилась только для текущего пользователя, а 0.2.x — для всех.
@@ -40,30 +40,33 @@ TikTok, скачивание видео (приоритет форматов б�
 
 | Файл                         | Что это                              | Как ставить                     |
 | ---------------------------- | ------------------------------------ | ------------------------------- |
-| `TikTokMod-0.4.8.AppImage`   | Один файл, ничего не пишет в систему | `chmod +x` и запуск             |
-| `tiktok-mod_0.4.8_amd64.deb` | Обычный пакет: меню, иконка, `apt`   | `sudo apt install ./файл.deb`   |
-| `tiktok-mod-0.4.8.tar.gz`    | Просто распакованная папка           | распаковать, запустить бинарник |
+| `TikTokMod-0.4.9.AppImage`   | Один файл, ничего не пишет в систему | `chmod +x` и запуск             |
+| `tiktok-mod_0.4.9_amd64.deb` | Обычный пакет: меню, иконка, `apt`   | `sudo apt install ./файл.deb`   |
+| `tiktok-mod-0.4.9.tar.gz`    | Просто распакованная папка           | распаковать, запустить `tiktok-mod` |
 
 **Manjaro и прочие дистрибутивы на Arch** — правильный путь AppImage: пакетным
 менеджером там pacman, а не dpkg, так что `.deb` не ставится штатно.
 
 ```bash
-chmod +x TikTokMod-0.4.8.AppImage
-./TikTokMod-0.4.8.AppImage
+chmod +x TikTokMod-0.4.9.AppImage
+./TikTokMod-0.4.9.AppImage
 ```
 
 Настройки, cookies и сессия встроенного браузера лежат в `~/.config/tiktok-mod`
 и создаются с нуля при первом запуске.
 
-AppImage запускается через FUSE, поэтому нужен пакет `fuse2`
-(`sudo pacman -S fuse2`). Ставить его не хочется — AppImage распакует себя сам:
+AppImage запускается через FUSE, поэтому нужен пакет `fuse2` на Arch
+(`sudo pacman -S fuse2`) или `libfuse2` на Debian/Ubuntu
+(`sudo apt install libfuse2`). Ставить его не хочется — AppImage распакует себя
+сам:
 
 ```bash
-./TikTokMod-0.4.8.AppImage --appimage-extract-and-run
+./TikTokMod-0.4.9.AppImage --appimage-extract-and-run
 ```
 
 `.deb` предназначен для Debian/Ubuntu и производных. Зависимости стандартные —
-`gtk3`, `nss`, `alsa-lib`, `libxss1`; на Manjaro и Ubuntu они обычно уже есть.
+`libgtk-3-0`, `libnss3`, `libasound2`, `libxss1`; на Manjaro и Ubuntu они обычно
+уже есть.
 
 ## Запись эфиров
 
@@ -716,7 +719,7 @@ npm run dist:win     # NSIS + portable .exe
 npm run dist:linux   # AppImage + .deb + tar.gz
 ```
 
-Требуется Node.js 18+.
+Требуется Node.js 20+.
 
 `npm install` дополнительно скачивает `yt-dlp` и `ffmpeg` в `vendor/bin` — эта
 папка в репозиторий не попадает, в репозитории лежит только `vendor/x-gnarly`.
@@ -735,8 +738,9 @@ npm run dist:linux   # AppImage + .deb + tar.gz
 
 `.deb` electron-builder собирает через `fpm` со встроенным Ruby, которому нужен
 `libcrypt.so.1`: на Manjaro его даёт `libxcrypt-compat`, на Ubuntu —
-`libcrypt1`. AppImage и `tar.gz` от него не зависят и собираются в любом случае.
-В CI зависимость ставится явно.
+`libcrypt1`. AppImage и `tar.gz` от него не зависят, но собираются они тем же
+запуском `electron-builder`: если `.deb` не собрался, шаг сборки падает целиком
+и артефакты в релиз не попадают. В CI зависимость ставится явно.
 
 ### Диагностика
 
@@ -801,10 +805,11 @@ platform-specific и пересоздаётся командой выше, — �
 `scripts/before-pack.js` вычищает из `vendor/bin` бинарники чужих платформ,
 иначе Linux-пакет унёс бы с собой мёртвый `yt-dlp.exe`, а Windows — `yt-dlp`.
 
-`ffprobe` намеренно не поставляется: приложение его нигде не запускает — в
-диагностике показывается путь, только если бинарник есть в системе, — а
-статическая сборка весит ещё 80 МБ. Запись эфиров и склейка форматов идут через
-один `ffmpeg`.
+`ffprobe` поставляется только на Windows: `postinstall.js` скачивает
+`ffprobe.exe` вместе с `ffmpeg.exe`. На Linux его намеренно нет — приложение его
+нигде не запускает (в диагностике показывается путь, только если бинарник есть в
+системе), а статическая сборка весит ещё десятки мегабайт. Запись эфиров и
+склейка форматов идут через один `ffmpeg`.
 
 ### Почему ffmpeg проверяется перед использованием
 
@@ -842,17 +847,22 @@ src/main/main.js       окно, меню, IPC, прокси для сессии
 src/main/ttapi.js      клиент мобильного API TikTok с подменой региона
 src/main/regions.js    профили регионов: операторы (MCC/MNC), таймзоны, языки, app_info
 src/main/geo.js        определение страны по IP и проверка согласованности с регионом
+src/main/geobypass.js  обход геоблока: модель региона, роуминг, кластеры CDN
 src/main/engine.js     выбор движка: мобильный API с откатом на yt-dlp
 src/main/feed.js       сбор видео из отрисованной страницы webview (лента рекомендаций)
+src/main/live.js       запись эфиров: «Поток» (ffmpeg), mux, диагностика
+src/main/livechat.js   чат эфира: подключение и чтение сообщений
 src/main/signer.js     слой подписей: X-Gnarly (встроенный) + опциональный Python sidecar
 src/main/ytdlp.js      аргументы, загрузка, очередь, прогресс, отмена, маппинг ошибок,
                        классификация ссылок (видео / лента / профиль / хештег / звук)
 src/main/binaries.js   поиск yt-dlp/ffmpeg: override → vendor/bin → PATH
 src/main/settings.js   настройки в userData/settings.json, SCHEMA_VERSION + raw() для миграций
 src/preload/preload.js contextBridge, без nodeIntegration
-src/preload/webview-preload.js preload гостя: перехват правого клика, гашение меню страницы
+src/preload/webview-preload.js preload гостя: перехват правого клика, меню «…», зеркало PiP
+src/preload/audio-capture-preload.js захват аудио вкладки
 src/renderer/          UI: index.html, styles.css, renderer.js
 scripts/postinstall.js загрузка бинарников
+e2e-recording.js       e2e-проверка записи эфира (в сборку не попадает)
 vendor/x-gnarly/       вендоренный encode.js/decode.js (MIT, justscrapeme) — в репозитории
 vendor/bin/            yt-dlp и ffmpeg — не в репозитории, скачивает postinstall
 ```

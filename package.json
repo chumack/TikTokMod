@@ -1,6 +1,6 @@
 {
   "name": "tiktok-mod",
-  "version": "0.4.8",
+  "version": "0.4.9",
   "description": "TikTok desktop client: browse, download without watermark, proxy/region support",
   "main": "src/main/main.js",
   "author": {
@@ -9,6 +9,9 @@
   },
   "license": "MIT",
   "private": true,
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",

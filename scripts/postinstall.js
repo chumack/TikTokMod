@@ -22,8 +22,12 @@ const isWin = process.platform === 'win32';
 function ytdlpAsset() {
   const { platform, arch } = process;
   if (platform === 'win32') {
-    if (arch === 'ia32') return { name: 'yt-dlp_x86.exe', asset: 'yt-dlp_x86.exe' };
-    if (arch === 'arm64') return { name: 'yt-dlp_arm64.exe', asset: 'yt-dlp_arm64.exe' };
+    // The file is always called yt-dlp.exe: the app resolves it by that name
+    // (src/main/binaries.js appends only ".exe"), while the ASSET is what
+    // differs per arch. Saving it as yt-dlp_x86.exe / yt-dlp_arm64.exe made
+    // the download useless — the binary was on disk but never found.
+    if (arch === 'ia32') return { name: 'yt-dlp.exe', asset: 'yt-dlp_x86.exe' };
+    if (arch === 'arm64') return { name: 'yt-dlp.exe', asset: 'yt-dlp_arm64.exe' };
     return { name: 'yt-dlp.exe', asset: 'yt-dlp.exe' };
   }
   if (platform === 'darwin') {
@@ -84,6 +88,25 @@ const FFMPEG = {
 
 function download(url, dest) {
   return new Promise((resolve, reject) => {
+    const tmp = `${dest}.part`;
+    let done = false;
+    const cleanup = () => {
+      try {
+        fs.rmSync(tmp, { force: true });
+      } catch {}
+    };
+    const fail = (err) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(err);
+    };
+    const succeed = () => {
+      if (done) return;
+      done = true;
+      resolve();
+    };
+
     const req = https.get(url, { headers: { 'user-agent': 'tiktok-mod-setup' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
@@ -91,25 +114,37 @@ function download(url, dest) {
       }
       if (res.statusCode !== 200) {
         res.resume();
-        return reject(new Error(`${url} -> HTTP ${res.statusCode}`));
+        return fail(new Error(`${url} -> HTTP ${res.statusCode}`));
       }
-      const tmp = `${dest}.part`;
       const out = fs.createWriteStream(tmp);
-      res.pipe(out);
+      // A connection that dies mid-body used to leave the promise pending
+      // forever: `npm install` exited 0, the binary was missing, and a .part
+      // file stayed behind. Every stream error now settles the promise, and
+      // the partial download is removed.
+      res.on('error', fail);
+      res.on('aborted', () => fail(new Error('connection aborted')));
+      out.on('error', fail);
       out.on('finish', () => {
-        out.close(() => {
-          fs.renameSync(tmp, dest);
+        out.close((err) => {
+          if (err) return fail(err);
+          try {
+            fs.renameSync(tmp, dest);
+          } catch (e) {
+            // renameSync throws on Windows when the target is locked (EPERM).
+            // It used to escape the close callback as an uncaught exception.
+            return fail(e);
+          }
           if (!isWin) {
             try {
               fs.chmodSync(dest, 0o755);
             } catch {}
           }
-          resolve();
+          succeed();
         });
       });
-      out.on('error', reject);
+      res.pipe(out);
     });
-    req.on('error', reject);
+    req.on('error', fail);
     req.setTimeout(60000, () => req.destroy(new Error('timeout')));
   });
 }

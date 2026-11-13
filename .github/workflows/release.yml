@@ -21,6 +21,10 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          # On workflow_dispatch the tag is an input, and the build must run
+          # on the commit that tag points to — not on the default branch.
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -69,6 +73,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -96,6 +102,28 @@ jobs:
     needs: [linux, windows]
     runs-on: ubuntu-22.04
     steps:
+      # The build jobs already ran on the tag; check the tag against
+      # package.json so a release cannot be published under a name the code
+      # does not declare.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Check the tag matches package.json
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          node -e "
+            const fs = require('node:fs');
+            const tag = String(process.env.TAG).replace(/^refs\/tags\//, '').replace(/^v/, '');
+            const version = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
+            if (tag !== version) {
+              console.error('tag ' + tag + ' does not match package.json ' + version);
+              process.exit(1);
+            }
+            console.log('tag ' + tag + ' matches package.json');
+          "
+
       - name: Download Linux artifacts
         uses: actions/download-artifact@v4
         with:
@@ -146,8 +174,12 @@ jobs:
               --clobber \
               --repo "$GITHUB_REPOSITORY"
           else
+            # --verify-tag refuses to invent a tag that does not exist on the
+            # remote — a manual dispatch with a typo'd name used to create one
+            # out of the default branch's code.
             gh release create "$TAG" "${files[@]}" \
               --repo "$GITHUB_REPOSITORY" \
               --title "TikTokMod $TAG" \
+              --verify-tag \
               --generate-notes
           fi

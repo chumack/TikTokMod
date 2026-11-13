@@ -37,7 +37,14 @@ const FLAG = { x0: 0.490, y0: 0.250, cx: 0.730, cy: 0.305, x1: 0.690, y1: 0.455,
 function roundedRect(x, y, c) {
   const dx = Math.max(c.x - x, 0, x - (c.x + c.w));
   const dy = Math.max(c.y - y, 0, y - (c.y + c.h));
-  if (dx > 0 && dy > 0) return Math.hypot(dx, dy) - c.r;
+  if (dx > 0 && dy > 0) {
+    // Outside both slabs: the nearest point of the shape is the rounded
+    // corner, and the arc's centre sits r INSIDE the corner, not on it.
+    // Measuring from the corner itself (the old code) returned a negative
+    // distance for the whole square outside the arc, so the four canvas
+    // corners were painted — visible as 41x41 px blocks in build/icon.png.
+    return Math.hypot(dx + c.r, dy + c.r) - c.r;
+  }
   const qx = Math.max(c.x + c.r - x, 0, x - (c.x + c.w - c.r));
   const qy = Math.max(c.y + c.r - y, 0, y - (c.y + c.h - c.r));
   return Math.hypot(qx, qy) - c.r;
