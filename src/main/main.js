@@ -1190,6 +1190,7 @@ const pipState = {
   swaps: 0,
   failures: 0,
   advances: 0,
+  advanceTries: 0,
   at: 0,
 };
 ipcMain.on('feed:pip', (_e, info) => {
@@ -1200,6 +1201,7 @@ ipcMain.on('feed:pip', (_e, info) => {
   pipState.swaps = Number(info.swaps) || 0;
   pipState.failures = Number(info.failures) || 0;
   pipState.advances = Number(info.advances) || 0;
+  pipState.advanceTries = Number(info.advanceTries) || 0;
   pipState.at = Date.now();
   console.log(
     '[pip]',
@@ -1208,7 +1210,8 @@ ipcMain.on('feed:pip', (_e, info) => {
     pipState.id || '-',
     'swaps=' + pipState.swaps,
     'failures=' + pipState.failures,
-    'advances=' + pipState.advances
+    'advances=' + pipState.advances,
+    'tries=' + pipState.advanceTries
   );
 });
 
@@ -1232,6 +1235,7 @@ async function showDiagnostics() {
     `  ${pipState.type ? pipState.type + (pipState.detail ? ' (' + pipState.detail + ')' : '') : 'окно не открыто'}`,
     `  ролик в окне: ${pipState.id || '—'}`,
     `  переключений: ${pipState.swaps}, ошибок: ${pipState.failures}, прокруток: ${pipState.advances}`,
+    `  нажатий «следующее/предыдущее»: ${pipState.advanceTries}`,
     '',
     `Эмулируемое устройство:`,
     `  регион: ${profile.region} (${profile.country}), оператор ${profile.carrier || '—'} ${profile.carrierMccmnc}`,

@@ -667,6 +667,7 @@ const pip = {
   failures: 0,
   consecutiveFailures: 0,
   advances: 0,
+  advanceTries: 0,
   endedTimer: 0,
   advanceTimers: [],
   lastReportedAt: {},
@@ -690,6 +691,7 @@ function pipReport(type, detail) {
       swaps: pip.swaps,
       failures: pip.failures,
       advances: pip.advances,
+      advanceTries: pip.advanceTries,
     });
   } catch (_) {}
 }
@@ -729,16 +731,21 @@ function pipClipId(video) {
 
 /**
  * The scroll box the feed actually scrolls — the same rule as feed.js: the
- * scrollable box that holds the clip links of the feed. Taking the first
+ * scrollable box that holds the cards of the feed. Taking the first
  * scrollable ancestor instead used to pick whatever column happened to be
  * scrollable, and on a video page that can be the recommendation sidebar.
+ *
+ * MEASURED on the live page: TikTok's column of clips is a
+ * div[class*="DivColumnListContainer"] whose overflow-y is sometimes «hidden»
+ * — it is still the box whose scrollTop follows the feed (0 → 768 → 1536 …),
+ * so it must not be skipped just because the style says «hidden».
  */
 function pipScrollBox(video) {
   const scrollable = (el) => {
     try {
       const cs = window.getComputedStyle(el);
       const oy = (cs && (cs.overflowY || cs.overflow)) || '';
-      if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay') return false;
+      if (oy !== 'auto' && oy !== 'scroll' && oy !== 'overlay' && oy !== 'hidden') return false;
       return el.scrollHeight > el.clientHeight + 40;
     } catch (_) {
       return false;
@@ -795,27 +802,54 @@ function pipCardOf(video) {
 /**
  * TikTok's own chevron for "next / previous clip", if this layout renders one.
  * Clicking it is the most faithful way to advance: the page runs its own
- * prefetch and play logic. Only visible buttons inside this feed are accepted,
- * so a chevron belonging to another column cannot be pressed by mistake.
+ * prefetch and play logic.
+ *
+ * MEASURED on the live page (/foryou, 1280x800): the feed navigation is
+ * [data-e2e="feed-navigation-next"] and [data-e2e="feed-navigation-prev"] —
+ * two 40x40 buttons at the RIGHT EDGE of the window, while the column of
+ * clips sits in the middle. Two mistakes made the window's «next» a no-op:
+ *   * the selector list named feed-arrow-down and friends — markup TikTok does
+ *     not have, so the button was never found at all;
+ *   * the rule "the button must lie inside the feed column" rejected exactly
+ *     these buttons, because the page puts them outside the column.
+ *
+ * The fallback for other layouts still looks at the aria-label, but only
+ * accepts buttons that belong to THIS column — otherwise «Скачать» or any
+ * other control of the page could be pressed by mistake.
  */
 function pipSwitchButton(dir, box, card) {
+  const visible = (el) => {
+    const r = rectOf(el);
+    return Boolean(r);
+  };
+
+  // 1. The page's own feed navigation. These buttons stand OUTSIDE the clip
+  //    column, so the "inside the column" rule does not apply to them.
+  const navSelectors = dir > 0
+    ? ['[data-e2e="feed-navigation-next"]', '[data-e2e="feed-navigation-down"]']
+    : ['[data-e2e="feed-navigation-prev"]', '[data-e2e="feed-navigation-up"]'];
+  for (let i = 0; i < navSelectors.length; i += 1) {
+    let list = [];
+    try {
+      list = document.querySelectorAll(navSelectors[i]);
+    } catch (_) {
+      list = [];
+    }
+    for (let j = 0; j < list.length; j += 1) {
+      if (visible(list[j])) return list[j];
+    }
+  }
+
+  // 2. Arrows drawn inside the column (other layouts).
+  const inFeed = (el) => {
+    if (!box && !card) return false;
+    if (box && el !== box && !box.contains(el) && !(card && card.contains(el))) return false;
+    if (!box && card && !card.contains(el)) return false;
+    return true;
+  };
   const selectors = dir > 0
     ? ['[data-e2e="feed-arrow-down"]', '[data-e2e="arrow-down"]', '[data-e2e="feed-arrow-right"]', '[data-e2e="arrow-right"]']
     : ['[data-e2e="feed-arrow-up"]', '[data-e2e="arrow-up"]', '[data-e2e="feed-arrow-left"]', '[data-e2e="arrow-left"]'];
-  const wanted = dir > 0 ? /следующ|вниз|next|down/i : /предыдущ|вверх|previous|prev|up/i;
-  const found = [];
-  const push = (el) => {
-    if (!el || found.indexOf(el) !== -1) return;
-    const r = rectOf(el);
-    if (!r) return;
-    // Only a button of THIS feed column may be pressed. Without a column and
-    // a card the check would accept any button on the page — «Скачать» or
-    // «прокрутить вниз» included.
-    if (!box && !card) return;
-    if (box && el !== box && !box.contains(el) && !(card && card.contains(el))) return;
-    if (!box && card && !card.contains(el)) return;
-    found.push(el);
-  };
   for (let i = 0; i < selectors.length; i += 1) {
     let list = [];
     try {
@@ -823,29 +857,61 @@ function pipSwitchButton(dir, box, card) {
     } catch (_) {
       list = [];
     }
-    for (let j = 0; j < list.length; j += 1) push(list[j]);
-    if (found.length) break;
-  }
-  if (!found.length) {
-    // Locales without a known data-e2e: the aria-label still names the action.
-    let buttons = [];
-    try {
-      buttons = document.querySelectorAll('button[aria-label], [role="button"][aria-label]');
-    } catch (_) {
-      buttons = [];
-    }
-    for (let i = 0; i < buttons.length; i += 1) {
-      const label = buttons[i].getAttribute('aria-label') || '';
-      if (wanted.test(label)) push(buttons[i]);
+    for (let j = 0; j < list.length; j += 1) {
+      if (visible(list[j]) && inFeed(list[j])) return list[j];
     }
   }
-  return found.length ? found[0] : null;
+
+  // 3. Locales without a known data-e2e: the aria-label still names the action.
+  const wanted = dir > 0 ? /следующ|вниз|next|down/i : /предыдущ|вверх|previous|prev|up/i;
+  let buttons = [];
+  try {
+    buttons = document.querySelectorAll('button[aria-label], [role="button"][aria-label]');
+  } catch (_) {
+    buttons = [];
+  }
+  for (let i = 0; i < buttons.length; i += 1) {
+    const label = buttons[i].getAttribute('aria-label') || '';
+    if (wanted.test(label) && visible(buttons[i]) && inFeed(buttons[i])) return buttons[i];
+  }
+  return null;
+}
+
+/**
+ * The clip id of the card in the CENTRE of the viewport, taken from the markup.
+ *
+ * The <video> element is a bad witness right after the feed moves: TikTok
+ * re-binds the player to the next clip only when the media is ready, so for a
+ * while the element still reports the previous clip. The card in the middle of
+ * the screen changes at once — that is the honest signal that the feed moved.
+ */
+function pipCentreCardId() {
+  try {
+    const mid = (window.innerHeight || 0) / 2;
+    const cards = document.querySelectorAll('article, section[data-e2e="feed-video"], [data-e2e="feed-video"]');
+    for (let i = 0; i < cards.length; i += 1) {
+      const r = rectOf(cards[i]);
+      if (!r) continue;
+      if (r.top <= mid && r.bottom >= mid) {
+        let wrapper = null;
+        try {
+          wrapper = cards[i].querySelector('[id^="xgwrapper-0-"]');
+        } catch (_) {}
+        if (wrapper) {
+          const tail = String(wrapper.id || '').split('-').pop();
+          if (VIDEO_ID_RE.test(tail)) return tail;
+        }
+        return '';
+      }
+    }
+  } catch (_) {}
+  return '';
 }
 
 /**
  * Moves the REAL feed one card forward/back. Strategies are tried in order and
- * each is verified by the clip id actually changing, because a scroll that the
- * page ignores must not look like a successful "next".
+ * each is verified by the feed really moving, because a scroll that the page
+ * ignores must not look like a successful "next".
  */
 function pipAdvance(dir, reason) {
   if (!pip.active) return;
@@ -855,10 +921,23 @@ function pipAdvance(dir, reason) {
   const video = (current && current.video) || document.pictureInPictureElement;
   const box = pipScrollBox(video);
   const card = pipCardOf(video);
-  pip.advances += 0;
+  const fromTop = box ? box.scrollTop : 0;
+  const fromCardId = pipCentreCardId();
+  pip.advanceTries += 1;
   pipReport('advance-try', `${reason || 'manual'} ${step > 0 ? 'next' : 'prev'}`);
 
   const moved = () => {
+    // 1. The feed column moved — the most direct evidence, and the one that
+    //    shows up at once: the video element needs time to be re-bound.
+    if (box) {
+      try {
+        if (Math.abs(box.scrollTop - fromTop) > 1) return true;
+      } catch (_) {}
+    }
+    // 2. The card in the centre of the screen changed.
+    const cardId = pipCentreCardId();
+    if (fromCardId && cardId && cardId !== fromCardId) return true;
+    // 3. The player was re-bound to another clip.
     const now = pipVisible();
     if (!now || !now.video) return false;
     const print = pipFingerprint(now.video);
@@ -868,51 +947,87 @@ function pipAdvance(dir, reason) {
     return Boolean(print && print !== fromPrint);
   };
 
-  const strategies = [
-    () => {
-      const btn = pipSwitchButton(step, box, card);
-      if (!btn) return false;
+  // The page's own navigation button. MEASURED on the live page: the whole
+  // sequence a mouse sends (pointer + mouse + click) moves the feed by exactly
+  // one card, and the plain click alone works too — the page reacts to the
+  // click. One strategy, one click: two strategies in a row would skip a clip.
+  const navClick = () => {
+    const btn = pipSwitchButton(step, box, card);
+    if (!btn) return false;
+    const r = rectOf(btn);
+    if (!r) return false;
+    const x = Math.round(r.left + r.width / 2);
+    const y = Math.round(r.top + r.height / 2);
+    const base = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: x,
+      clientY: y,
+      button: 0,
+    };
+    try {
+      if (typeof PointerEvent === 'function') {
+        btn.dispatchEvent(new PointerEvent('pointerdown', { ...base, buttons: 1 }));
+        btn.dispatchEvent(new PointerEvent('pointerup', { ...base, buttons: 0 }));
+      }
+      btn.dispatchEvent(new MouseEvent('mousedown', { ...base, buttons: 1 }));
+      btn.dispatchEvent(new MouseEvent('mouseup', { ...base, buttons: 0 }));
+      btn.dispatchEvent(new MouseEvent('click', { ...base, buttons: 0, detail: 1 }));
+      return true;
+    } catch (_) {
+      // A layout that only accepts a plain click.
       try {
         btn.click();
         return true;
       } catch (_) {
         return false;
       }
-    },
-    () => {
-      if (!box) return false;
-      const h = card && card.offsetHeight ? card.offsetHeight : 0;
-      // The step of feed.js: a little less than a screen, so a card is not
-      // skipped over.
-      const unit =
-        h > box.clientHeight * 0.5 && h < box.clientHeight * 1.5
-          ? h
-          : Math.round(box.clientHeight * 0.9);
-      if (!(unit > 0)) return false;
+    }
+  };
+
+  // The step of feed.js: a little less than a screen, so a card is not
+  // skipped over. The result is checked: a box that ignores the scroll must
+  // not look like a successful "next".
+  const scrollBy = () => {
+    if (!box) return false;
+    const before = box.scrollTop;
+    const h = card && card.offsetHeight ? card.offsetHeight : 0;
+    const unit =
+      h > box.clientHeight * 0.5 && h < box.clientHeight * 1.5
+        ? h
+        : Math.round(box.clientHeight * 0.9);
+    if (!(unit > 0)) return false;
+    try {
+      box.scrollTo({ top: before + step * unit, behavior: 'smooth' });
+    } catch (_) {
       try {
-        box.scrollTo({ top: box.scrollTop + step * unit, behavior: 'smooth' });
-        return true;
-      } catch (_) {
-        box.scrollTop += step * unit;
-        return true;
-      }
-    },
-    () => {
-      if (!box) return false;
-      const unit = Math.round((box.clientHeight || window.innerHeight) * 0.9);
-      try {
-        box.scrollTop += step * unit;
-        // Some layouts only react to a wheel event (same trick as feed.js).
-        box.dispatchEvent(new WheelEvent('wheel', { deltaY: step * 1200, bubbles: true }));
-        return true;
+        box.scrollTop = before + step * unit;
       } catch (_) {
         return false;
       }
-    },
-  ];
+    }
+    return box.scrollTop !== before;
+  };
+
+  // Some layouts only react to a wheel event (same trick as feed.js).
+  const wheelBy = () => {
+    if (!box) return false;
+    const before = box.scrollTop;
+    const unit = Math.round((box.clientHeight || window.innerHeight) * 0.9);
+    try {
+      box.scrollTop = before + step * unit;
+      box.dispatchEvent(new WheelEvent('wheel', { deltaY: step * 1200, bubbles: true }));
+    } catch (_) {
+      return false;
+    }
+    return box.scrollTop !== before;
+  };
+
+  const strategies = [navClick, scrollBy, wheelBy];
 
   let attempt = 0;
-  let misses = 0;
   const tryNext = () => {
     if (!pip.active) return;
     if (moved()) {
@@ -923,29 +1038,25 @@ function pipAdvance(dir, reason) {
       pipSync('advanced');
       return;
     }
-    misses += 1;
-    if (misses >= 2 && attempt < strategies.length) {
-      // The previous strategy did not move the feed: try the next one. Two
-      // strategies in a row would skip a clip, so the next one is used only
-      // after the current one has clearly failed.
-      misses = 0;
-      const run = strategies[attempt];
-      attempt += 1;
-      let ok = false;
-      try {
-        ok = run();
-      } catch (_) {
-        ok = false;
-      }
-      if (!ok) {
-        tryNext();
-        return;
-      }
-    } else if (attempt >= strategies.length) {
+    if (attempt >= strategies.length) {
       // End of the loaded feed, or a layout none of the strategies moves.
       pipReport('advance-stuck', reason || null);
       return;
     }
+    const run = strategies[attempt];
+    attempt += 1;
+    let ok = false;
+    try {
+      ok = run();
+    } catch (_) {
+      ok = false;
+    }
+    if (!ok) {
+      // The strategy did nothing at all — the next one is tried right away.
+      tryNext();
+      return;
+    }
+    // Give the page a moment to move the feed, then check what happened.
     const t = setTimeout(() => {
       pip.advanceTimers = pip.advanceTimers.filter((x) => x !== t);
       tryNext();
@@ -1025,6 +1136,11 @@ function pipSync(reason) {
   // event cannot be trusted for this — the spec fires it for a SWAP as well —
   // so the poll is the reliable place to notice a real close.
   if (!open) {
+    // A SWAP frees the element for a moment: the old <video> leaves the
+    // window before the new one enters it, and pictureInPictureElement is
+    // null in between. Killing the mirror there would kill it exactly when
+    // the window is being pointed at the next clip of the feed.
+    if (pip.swapping) return;
     pipStop();
     return;
   }
@@ -1286,6 +1402,9 @@ function installPipMirror() {
     },
     get advances() {
       return pip.advances;
+    },
+    get advanceTries() {
+      return pip.advanceTries;
     },
     get lastId() {
       return pip.lastId;
